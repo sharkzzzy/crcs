@@ -177,6 +177,7 @@ class CARCPipeline:
             )
         return mapping
 
+
     @torch.no_grad()
     def __call__(
         self,
@@ -184,23 +185,21 @@ class CARCPipeline:
         subjects: List[Dict[str, str]],
         width: int = 1024,
         height: int = 1024,
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 40,
         cfg_pos: float = 7.5,
         cfg_neg: float = 3.0,
         mask_update_interval: int = 5,
+        bg_update_interval: int = 5, # New: optimization
         beta: float = 0.7,
         safety_expand: float = 0.15,
         seed: int = 42,
     ):
         _seed_everything(seed)
         
-        # 1. Embeddings
+        # 1. Setup
         embs = self._prepare_embeddings(global_prompt, subjects, width, height)
-        
-        # 2. Token Indices
         self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
         
-        # 3. Latents
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
         
@@ -209,79 +208,99 @@ class CARCPipeline:
             generator=torch.Generator(device=self.device).manual_seed(seed)
         )
         
-        # 4. Masks
         latent_h, latent_w = height // 8, width // 8
         mask_mgr = DynamicMaskManager.init_from_positions(
             (height, width), (latent_h, latent_w), subjects, safety_expand, 
             device=self.device, dtype=self.dtype
         )
-
-        # 5. Loop
         self.attn_proc.set_base_latent_hw(latent_h, latent_w)
         
+        # 2. Main Loop
         for i, t in enumerate(timesteps):
-            self.attn_proc.set_step(int(t), num_inference_steps)
+            # Pass step index for Alpha scheduling
+            self.attn_proc.set_step_index(i, num_inference_steps)
             
-            # --- A. Background (Record) ---
-            self.context_bank.clear()
-            self.attn_proc.set_mode("record_bg")
-            self.attn_proc.set_probe_enabled(False)
+            # --- Phase 1: Background Recording (Optimized) ---
+            # Only update BG KV cache every K steps
+            if i % bg_update_interval == 0:
+                self.context_bank.clear()
+                self.attn_proc.set_mode("record_bg")
+                self.attn_proc.set_probe_enabled(False)
+                
+                # Single pass: Only Positive Condition to record "clean" background features
+                # No Uncond here.
+                _unet_forward(
+                    self.unet, latents, t, 
+                    embs["global"]["pos"], 
+                    embs["global"]["added_pos"]
+                )
             
-            g_emb = embs["global"]
+            # --- Phase 2: Compute Background Noise (CFG) ---
+            # Mode off: we don't want to record again, nor inject
+            self.attn_proc.set_mode("off")
             eps_bg = compute_cfg(
-                self.unet, latents, t, 
-                g_emb["pos"], g_emb["uncond"],
-                g_emb["added_pos"], g_emb["added_uncond"],
+                self.unet, latents, t,
+                embs["global"]["pos"], embs["global"]["uncond"],
+                embs["global"]["added_pos"], embs["global"]["added_uncond"],
                 cfg_pos
             )
             
-            # --- B. Subjects (Inject + Contrastive) ---
-            probe_now = (i % mask_update_interval == 0)
-            self.attn_proc.set_mode("inject_subject")
-            self.attn_proc.set_probe_enabled(probe_now)
-            
+            # --- Phase 3: Subjects ---
+            do_probe = (i % mask_update_interval == 0)
             eps_subjects = {}
+            
             for sid, subj in enumerate(subjects):
                 name = subj["name"]
                 self.attn_proc.set_subject_id(sid)
-                
                 s_emb = embs[name]
+                
+                # A) Clean Probe Pass (Single Batch)
+                # Only run if we need to update masks. 
+                # This pass injects BG context but only uses Positive prompt to probe attention.
+                if do_probe:
+                    self.attn_proc.set_mode("inject_subject")
+                    self.attn_proc.set_probe_enabled(True)
+                    _unet_forward(
+                        self.unet, latents, t, 
+                        s_emb["pos"], s_emb["added_pos"]
+                    )
+                
+                # B) Noise Prediction (Batch=3: Uncond, Pos, NegTarget)
+                # Disable probe, keep injection
+                self.attn_proc.set_mode("inject_subject")
+                self.attn_proc.set_probe_enabled(False)
+                
+                # Note: 'inject_subject' logic inside processor will auto-repeat BG KV 
+                # to match this batch size (3).
                 if s_emb["neg_target"] is not None:
-                    # Contrastive
                     eps_sub = compute_contrastive_cfg(
                         self.unet, latents, t,
                         s_emb["pos"], s_emb["uncond"], s_emb["neg_target"],
                         s_emb["added_pos"], s_emb["added_uncond"], 
-                        # Assuming neg_target reuses added_pos/uncond structure
                         cfg_pos, cfg_neg
                     )
                 else:
-                    # Standard
                     eps_sub = compute_cfg(
                         self.unet, latents, t,
                         s_emb["pos"], s_emb["uncond"],
-                        s_emb["added_pos"], s_emb["added_uncond"],
+                        s_emb["added_pos"], s_emb["added_uncond"], 
                         cfg_pos
                     )
                 eps_subjects[name] = eps_sub
 
-            # --- C. Compose ---
+            # --- Phase 4: Composition ---
             masks_latent, bg_mask_latent = mask_mgr.get_masks_latent()
             
-            # Expand masks to [B, 4, H, W]
             def expand(m): return m.expand(latents.shape[0], 4, -1, -1)
-            
             eps_final = eps_bg * expand(bg_mask_latent)
             for name, eps_s in eps_subjects.items():
                 eps_final += eps_s * expand(masks_latent[name])
                 
-            # --- D. Step ---
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
             
-            # Update Masks
-            if probe_now:
+            # --- Phase 5: Mask Update ---
+            if do_probe:
                 attn_maps = self.attn_proc.pop_attn_maps()
-                # Upsample latent maps to image res for manager
                 maps_img = {}
                 for sid, amap in attn_maps.items():
                     name = subjects[sid]["name"]
@@ -290,7 +309,7 @@ class CARCPipeline:
                 if maps_img:
                     mask_mgr.update_from_attn(maps_img)
 
-        # 6. Decode
+        # Decode
         image = _decode_vae(self.vae, latents)
         return {"image": image}
 
