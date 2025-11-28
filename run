@@ -1,44 +1,146 @@
-Traceback (most recent call last):
-  File "/home/linux/PycharmProjects/pythonProject/new project/run_carc_demo.py", line 73, in <module>
-    output = carc_pipe(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
-    return func(*args, **kwargs)
-  File "/home/linux/PycharmProjects/pythonProject/new project/pipeline_carc.py", line 232, in __call__
-    _unet_forward(
-  File "/home/linux/PycharmProjects/pythonProject/new project/guidance.py", line 15, in _unet_forward
-    out = unet(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_condition.py", line 1215, in forward
-    sample, res_samples = downsample_block(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 1270, in forward
-    hidden_states = attn(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/transformers/transformer_2d.py", line 427, in forward
-    hidden_states = block(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/attention.py", line 995, in forward
-    attn_output = self.attn1(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/attention_processor.py", line 605, in forward
-    return self.processor(
-  File "/home/linux/PycharmProjects/pythonProject/new project/attention_processor.py", line 290, in __call__
-    context, attn_probs = self._compute_attention(query, key, value, scale, attention_mask)
-  File "/home/linux/PycharmProjects/pythonProject/new project/attention_processor.py", line 171, in _compute_attention
-    attn_scores = torch.bmm(q, k.transpose(1, 2)) * scale
-torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1280.00 GiB. GPU 0 has a total capacity of 21.66 GiB of which 9.94 GiB is free. Including non-PyTorch memory, this process has 11.71 GiB memory in use. Of the allocated memory 10.50 GiB is allocated by PyTorch, and 1.03 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+import torch
+import torch.nn.functional as F
+from diffusers import StableDiffusionXLPipeline
+from PIL import Image
+
+# ==============================================================================
+# 1. 基础设置
+# ==============================================================================
+device = "cuda"
+model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+
+# 加载模型
+print("🚀 Loading SDXL...")
+pipe = StableDiffusionXLPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,
+    variant="fp16",
+    use_safetensors=True
+).to(device)
+
+# 启用 CPU Offload 以节省显存 (24G 显存其实不开启也能跑，开启更稳)
+# pipe.enable_model_cpu_offload() 
+
+# ==============================================================================
+# 2. 辅助函数：生成简单的左右 Mask
+# ==============================================================================
+def get_masks(height, width, device):
+    # 简单的左右分屏 Mask
+    # Mask 形状: [1, 1, H, W] (Latent空间)
+    latent_h, latent_w = height // 8, width // 8
+    
+    # 1. 左边 Mask (0.0 - 0.5)
+    mask_left = torch.zeros(1, 1, latent_h, latent_w, device=device)
+    mask_left[..., :latent_w // 2] = 1.0
+    
+    # 2. 右边 Mask (0.5 - 1.0)
+    mask_right = torch.zeros(1, 1, latent_h, latent_w, device=device)
+    mask_right[..., latent_w // 2:] = 1.0
+    
+    # 3. 背景 Mask (全图，但在重叠区会被前景覆盖)
+    # 这里我们简单做：前景优先。
+    # 实际上为了融合，可以给一点羽化。
+    return mask_left, mask_right
+
+# ==============================================================================
+# 3. 核心：手写采样循环 (RCCS Logic)
+# ==============================================================================
+@torch.no_grad()
+def run_rccs(prompt_L, prompt_R, prompt_BG, seed=42):
+    height, width = 1024, 1024
+    steps = 40
+    guidance_scale = 7.5
+    
+    # 1. 准备 Embeddings
+    # 封装一个 helper 来获取 embedding 和 added_cond (time_ids)
+    def encode(text):
+        (pe, ne, pp, np) = pipe.encode_prompt(
+            text, device=device, num_images_per_prompt=1, do_classifier_free_guidance=True
+        )
+        return pe, ne, pp, np
+
+    # 编码三个提示词
+    pe_L, ne_L, pp_L, np_L = encode(prompt_L)
+    pe_R, ne_R, pp_R, np_R = encode(prompt_R)
+    pe_BG, ne_BG, pp_BG, np_BG = encode(prompt_BG)
+    
+    # 准备 Time IDs (分辨率信息)
+    add_time_ids = pipe._get_add_time_ids(
+        (height, width), (0, 0), (height, width), dtype=pe_L.dtype, text_encoder_projection_dim=pp_L.shape[-1]
+    ).to(device)
+    # 拼成 CFG 需要的 Batch=2 [Neg, Pos]
+    add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
+
+    # 2. 初始化 Latents
+    generator = torch.Generator(device=device).manual_seed(seed)
+    latents = torch.randn((1, 4, height//8, width//8), device=device, generator=generator, dtype=pe_L.dtype)
+    pipe.scheduler.set_timesteps(steps, device=device)
+    latents = latents * pipe.scheduler.init_noise_sigma
+
+    # 3. 准备 Masks
+    mask_L, mask_R = get_masks(height, width, device)
+    # 扩展到 latent 通道数 (4)
+    mask_L = mask_L.expand(1, 4, -1, -1).to(dtype=latents.dtype)
+    mask_R = mask_R.expand(1, 4, -1, -1).to(dtype=latents.dtype)
+    
+    # 背景 Mask: 剩余部分 (虽然这里左右拼满了，但为了平滑融合，我们可以设为全 1，通过加权平均)
+    # 简单策略：严格分区
+    # Noise = Noise_L * Mask_L + Noise_R * Mask_R
+    
+    print("🎨 Starting Denoising Loop...")
+    
+    for i, t in enumerate(pipe.scheduler.timesteps):
+        if i % 10 == 0: print(f"Step {i}/{steps}")
+        
+        # 扩充 Latents 以适应 CFG (Batch=2)
+        latent_model_input = torch.cat([latents] * 2)
+        latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+        
+        # --- A. 计算左边主体的噪声 (Left Cat) ---
+        # 传入 added_cond_kwargs 是 SDXL 的关键
+        noise_L = pipe.unet(
+            latent_model_input, t, encoder_hidden_states=torch.cat([ne_L, pe_L]),
+            added_cond_kwargs={"text_embeds": torch.cat([np_L, pp_L]), "time_ids": add_time_ids}
+        ).sample
+        # CFG
+        n_uncond, n_pos = noise_L.chunk(2)
+        noise_L = n_uncond + guidance_scale * (n_pos - n_uncond)
+        
+        # --- B. 计算右边主体的噪声 (Right Dog) ---
+        noise_R = pipe.unet(
+            latent_model_input, t, encoder_hidden_states=torch.cat([ne_R, pe_R]),
+            added_cond_kwargs={"text_embeds": torch.cat([np_R, pp_R]), "time_ids": add_time_ids}
+        ).sample
+        # CFG
+        n_uncond, n_pos = noise_R.chunk(2)
+        noise_R = n_uncond + guidance_scale * (n_pos - n_uncond)
+        
+        # --- C. 计算背景噪声 (可选，用于兜底或平滑) ---
+        # 如果左右拼满了，这一步可以省。如果中间有空隙，需要这一步。
+        # 这里演示最简版本：直接拼左右。
+        
+        # --- D. 组合 (Combine) ---
+        # 核心逻辑：只在左边用左边的噪声，右边用右边的噪声
+        noise_final = noise_L * mask_L + noise_R * mask_R
+        
+        # --- E. 更新 Latents ---
+        latents = pipe.scheduler.step(noise_final, t, latents).prev_sample
+
+    # 4. 解码
+    print("Decoding...")
+    latents = latents / pipe.vae.config.scaling_factor
+    image = pipe.vae.decode(latents).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+    return Image.fromarray((image[0] * 255).astype("uint8"))
+
+# ==============================================================================
+# 4. 运行测试
+# ==============================================================================
+prompt_left = "A red cat, high quality"
+prompt_right = "A blue dog, high quality"
+prompt_bg = "A park background" # 这里的简单版没用到背景融合，只做左右拼接
+
+img = run_rccs(prompt_left, prompt_right, prompt_bg)
+img.save("simple_rccs_result.png")
+print("✅ Done! Check simple_rccs_result.png")
