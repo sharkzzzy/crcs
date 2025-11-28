@@ -1,7 +1,6 @@
 """
 pipeline_carc.py
-FINAL V3: Fully Decoupled Logic (Record/CFG/Probe/Contrastive).
-Compatible with core/attention_processor.py V5.
+FINAL V4: Fixes Fatal Latent Size Bug & Uses Sequential Guidance.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
 
-# Explicit imports from core modules
+# Imports
 from .attention_processor import (
     CARCAttentionProcessor, ContextBank, AlphaScheduler, LayerSelector,
 )
@@ -27,6 +26,7 @@ def _seed_everything(seed: int):
     random.seed(seed)
 
 def _prepare_latents(batch_size, channels, height, width, dtype, device, scheduler, generator=None):
+    # 【修复点】这里传入的 height/width 已经是 latent 尺寸 (128)，不再是图像尺寸 (1024)
     shape = (batch_size, channels, height, width)
     latents = torch.randn(shape, device=device, dtype=dtype, generator=generator)
     latents = latents * scheduler.init_noise_sigma
@@ -46,7 +46,6 @@ def _attach_processors_to_unet(unet, processor: CARCAttentionProcessor):
     unet.set_attn_processor(processor)
 
 def _token_indices_for_keywords(tokenizer, prompt: str, keywords: List[str]) -> List[int]:
-    # Simplified heuristic matching
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
     decoded = [tokenizer.decode([i]).strip().lower() for i in input_ids]
     indices = []
@@ -54,21 +53,12 @@ def _token_indices_for_keywords(tokenizer, prompt: str, keywords: List[str]) -> 
     for i, token_str in enumerate(decoded):
         if any(k in token_str for k in kw_lower):
             indices.append(i) 
-    # Adjust for start token offset in SDXL
     return [i + 1 for i in indices] 
 
-
 class CARCPipeline:
-    """
-    Main CARC Pipeline Loop.
-    Features: 
-    - Separated Background Recording (Single Batch)
-    - Separated Probe Pass (Single Batch)
-    - Contrastive Guidance (Triple Batch)
-    """
     def __init__(
         self,
-        base_pipe, # StableDiffusionXLPipeline
+        base_pipe,
         alpha_cfg: Optional[Dict[str, Any]] = None,
         inject_layer_patterns: Optional[List[str]] = None,
     ):
@@ -79,17 +69,14 @@ class CARCPipeline:
         self.device = base_pipe.device
         self.dtype = self.unet.dtype
 
-        # Init Processor
         self.context_bank = ContextBank()
         alpha_scheduler = AlphaScheduler(**(alpha_cfg or {}))
-        # Use default safer layers if not provided
         layer_selector = LayerSelector(inject_layer_patterns)
         
         self.attn_proc = CARCAttentionProcessor(self.context_bank, alpha_scheduler, layer_selector)
         _attach_processors_to_unet(self.unet, self.attn_proc)
 
     def _encode_prompt(self, prompt: str, negative_prompt: str = ""):
-        # Reuse base pipe logic for full SDXL embedding stack
         (
             prompt_embeds,
             negative_prompt_embeds,
@@ -110,8 +97,6 @@ class CARCPipeline:
 
     def _prepare_embeddings(self, global_prompt, subjects, width, height):
         embs = {}
-        
-        # Standard Time IDs for SDXL
         original_size = (height, width)
         target_size = (height, width)
         crops_coords_top_left = (0, 0)
@@ -126,22 +111,17 @@ class CARCPipeline:
                 "added_uncond": {"text_embeds": neg_pool, "time_ids": add_time_ids},
             }
 
-        # Global Embeds
         pe, ne, pp, np = self._encode_prompt(global_prompt, "")
         embs["global"] = pack_cond(pe, ne, pp, np)
         
-        # Subject Embeds
         for subj in subjects:
             name = subj["name"]
             spe, sne, spp, snp = self._encode_prompt(subj["prompt"], "")
-            
             neg_target_text = subj.get("neg_target", "")
             if neg_target_text:
-                # For neg target, we get positive embedding of the 'negative concept'
                 nt_pe, _, nt_pp, _ = self._encode_prompt(neg_target_text, "")
                 embs[name] = pack_cond(spe, sne, spp, snp)
                 embs[name]["neg_target"] = nt_pe
-                # Reuse neg target's own pooled embed, but share time_ids
                 embs[name]["added_neg_target"] = {"text_embeds": nt_pp, "time_ids": add_time_ids}
             else:
                 embs[name] = pack_cond(spe, sne, spp, snp)
@@ -168,27 +148,30 @@ class CARCPipeline:
         cfg_pos: float = 7.5,
         cfg_neg: float = 3.0,
         mask_update_interval: int = 5,
-        bg_update_interval: int = 2,  # Optimization: Update BG KV every 2 steps
+        bg_update_interval: int = 2,
         beta: float = 0.7,
         safety_expand: float = 0.15,
         seed: int = 42,
-        return_intermediates: bool = False,
     ):
         _seed_everything(seed)
         
-        # 1. Setup
         embs = self._prepare_embeddings(global_prompt, subjects, width, height)
         self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
         
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
         
+        # 【致命 Bug 修复】
+        # 1. 先计算 latent 尺寸 (128x128)
+        latent_h, latent_w = height // 8, width // 8
+        
+        # 2. 用 latent 尺寸初始化张量，而不是用图像尺寸 (1024x1024)
         latents = _prepare_latents(
-            1, 4, height, width, self.dtype, self.device, self.scheduler,
+            1, 4, latent_h, latent_w, self.dtype, self.device, self.scheduler,
             generator=torch.Generator(device=self.device).manual_seed(seed)
         )
         
-        latent_h, latent_w = height // 8, width // 8
+        # 3. 将尺寸传给 MaskManager
         mask_mgr = DynamicMaskManager.init_from_positions(
             (height, width), (latent_h, latent_w), subjects, safety_expand, 
             device=self.device, dtype=self.dtype
@@ -196,28 +179,20 @@ class CARCPipeline:
 
         self.attn_proc.set_base_latent_hw(latent_h, latent_w)
         
-        # 2. Denoising Loop
-        intermediates = []
-        
         for i, t in enumerate(timesteps):
             self.attn_proc.set_step_index(i, num_inference_steps)
             
-            # --- Phase A: Background Recording (Optimized) ---
-            # Decoupled from CFG to avoid batch mixing
-            # Only run every K steps to save time
+            # Phase A: Background Record (Cond Only, Single Batch)
             if i % bg_update_interval == 0:
                 self.context_bank.clear()
                 self.attn_proc.set_mode("record_bg")
                 self.attn_proc.set_probe_enabled(False)
-                
-                # Single Batch Forward (Pos Only) -> Purest Features
                 _unet_forward(
                     self.unet, latents, t, 
-                    embs["global"]["pos"], 
-                    embs["global"]["added_pos"]
+                    embs["global"]["pos"], embs["global"]["added_pos"]
                 )
             
-            # --- Phase B: Compute Background Noise ---
+            # Phase B: Background Noise (Sequential CFG)
             self.attn_proc.set_mode("off")
             eps_bg = compute_cfg(
                 self.unet, latents, t, 
@@ -226,7 +201,7 @@ class CARCPipeline:
                 cfg_pos
             )
             
-            # --- Phase C: Subjects ---
+            # Phase C: Subjects
             do_probe = (i % mask_update_interval == 0)
             eps_subjects = {}
             
@@ -235,23 +210,17 @@ class CARCPipeline:
                 self.attn_proc.set_subject_id(sid)
                 s_emb = embs[name]
                 
-                # C.1 Probe Pass (Decoupled, Single Batch)
-                # Only if we need to update masks
+                # C.1 Probe
                 if do_probe:
                     self.attn_proc.set_mode("inject_subject")
                     self.attn_proc.set_probe_enabled(True)
-                    # Cond Only Forward -> Purest Attention Map
-                    _unet_forward(
-                        self.unet, latents, t, 
-                        s_emb["pos"], s_emb["added_pos"]
-                    )
+                    _unet_forward(self.unet, latents, t, s_emb["pos"], s_emb["added_pos"])
                 
-                # C.2 Noise Prediction (Contrastive Batch=3)
+                # C.2 Noise (Sequential Contrastive)
                 self.attn_proc.set_mode("inject_subject")
                 self.attn_proc.set_probe_enabled(False)
                 
                 if s_emb["neg_target"] is not None:
-                    # eps = u + s(p-u) - s_n(n-u)
                     eps_sub = compute_contrastive_cfg(
                         self.unet, latents, t,
                         s_emb["pos"], s_emb["uncond"], s_emb["neg_target"],
@@ -267,31 +236,26 @@ class CARCPipeline:
                     )
                 eps_subjects[name] = eps_sub
 
-            # --- Phase D: Composition ---
+            # Phase D: Compose
             masks_latent, bg_mask_latent = mask_mgr.get_masks_latent()
-            
             def expand(m): return m.expand(latents.shape[0], 4, -1, -1)
             
             eps_final = eps_bg * expand(bg_mask_latent)
             for name, eps_s in eps_subjects.items():
                 eps_final += eps_s * expand(masks_latent[name])
                 
-            # Step
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
             
-            # --- Phase E: Mask Update ---
+            # Phase E: Update
             if do_probe:
                 attn_maps = self.attn_proc.pop_attn_maps()
                 maps_img = {}
                 for sid, amap in attn_maps.items():
                     name = subjects[sid]["name"]
-                    # Resize latent map to image res
                     maps_img[name] = F.interpolate(amap, size=(height, width), mode="bilinear")
-                
                 if maps_img:
                     mask_mgr.update_from_attn(maps_img)
 
-        # 3. Decode
         image = _decode_vae(self.vae, latents)
         return {"image": image}
 
