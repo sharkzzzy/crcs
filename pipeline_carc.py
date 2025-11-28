@@ -1,6 +1,6 @@
 """
 pipeline_carc.py
-FINAL V4: Fixes Fatal Latent Size Bug & Uses Sequential Guidance.
+FINAL V5: Fixes Missing 'scale_model_input' (Cause of Black Image).
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
 
-# Imports
+# Explicit imports
 from .attention_processor import (
     CARCAttentionProcessor, ContextBank, AlphaScheduler, LayerSelector,
 )
@@ -26,14 +26,17 @@ def _seed_everything(seed: int):
     random.seed(seed)
 
 def _prepare_latents(batch_size, channels, height, width, dtype, device, scheduler, generator=None):
-    # 【修复点】这里传入的 height/width 已经是 latent 尺寸 (128)，不再是图像尺寸 (1024)
     shape = (batch_size, channels, height, width)
     latents = torch.randn(shape, device=device, dtype=dtype, generator=generator)
     latents = latents * scheduler.init_noise_sigma
     return latents
 
 def _decode_vae(vae, latents: torch.Tensor) -> torch.Tensor:
+    # 1. 缩放
     latents = latents / vae.config.scaling_factor
+    # 2. 强制转 float32 防止溢出黑图
+    latents = latents.to(dtype=torch.float32)
+    # 3. 解码
     with torch.no_grad():
         image = vae.decode(latents).sample
     image = (image / 2 + 0.5).clamp(0, 1)
@@ -155,23 +158,20 @@ class CARCPipeline:
     ):
         _seed_everything(seed)
         
+        # Init
         embs = self._prepare_embeddings(global_prompt, subjects, width, height)
         self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
         
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
         
-        # 【致命 Bug 修复】
-        # 1. 先计算 latent 尺寸 (128x128)
+        # Latents Init (Use Latent Size 128)
         latent_h, latent_w = height // 8, width // 8
-        
-        # 2. 用 latent 尺寸初始化张量，而不是用图像尺寸 (1024x1024)
         latents = _prepare_latents(
             1, 4, latent_h, latent_w, self.dtype, self.device, self.scheduler,
             generator=torch.Generator(device=self.device).manual_seed(seed)
         )
         
-        # 3. 将尺寸传给 MaskManager
         mask_mgr = DynamicMaskManager.init_from_positions(
             (height, width), (latent_h, latent_w), subjects, safety_expand, 
             device=self.device, dtype=self.dtype
@@ -179,23 +179,28 @@ class CARCPipeline:
 
         self.attn_proc.set_base_latent_hw(latent_h, latent_w)
         
+        # Loop
         for i, t in enumerate(timesteps):
             self.attn_proc.set_step_index(i, num_inference_steps)
             
-            # Phase A: Background Record (Cond Only, Single Batch)
+            # 【修复点 1】必须缩放 Latents！
+            latent_model_input = self.scheduler.scale_model_input(latents, t)
+            
+            # Phase A: Background Record
             if i % bg_update_interval == 0:
                 self.context_bank.clear()
                 self.attn_proc.set_mode("record_bg")
                 self.attn_proc.set_probe_enabled(False)
+                # 使用 scaled input
                 _unet_forward(
-                    self.unet, latents, t, 
+                    self.unet, latent_model_input, t, 
                     embs["global"]["pos"], embs["global"]["added_pos"]
                 )
             
-            # Phase B: Background Noise (Sequential CFG)
+            # Phase B: Background Noise
             self.attn_proc.set_mode("off")
             eps_bg = compute_cfg(
-                self.unet, latents, t, 
+                self.unet, latent_model_input, t, 
                 embs["global"]["pos"], embs["global"]["uncond"],
                 embs["global"]["added_pos"], embs["global"]["added_uncond"],
                 cfg_pos
@@ -214,22 +219,22 @@ class CARCPipeline:
                 if do_probe:
                     self.attn_proc.set_mode("inject_subject")
                     self.attn_proc.set_probe_enabled(True)
-                    _unet_forward(self.unet, latents, t, s_emb["pos"], s_emb["added_pos"])
+                    _unet_forward(self.unet, latent_model_input, t, s_emb["pos"], s_emb["added_pos"])
                 
-                # C.2 Noise (Sequential Contrastive)
+                # C.2 Noise
                 self.attn_proc.set_mode("inject_subject")
                 self.attn_proc.set_probe_enabled(False)
                 
                 if s_emb["neg_target"] is not None:
                     eps_sub = compute_contrastive_cfg(
-                        self.unet, latents, t,
+                        self.unet, latent_model_input, t,
                         s_emb["pos"], s_emb["uncond"], s_emb["neg_target"],
                         s_emb["added_pos"], s_emb["added_uncond"], 
                         cfg_pos, cfg_neg
                     )
                 else:
                     eps_sub = compute_cfg(
-                        self.unet, latents, t,
+                        self.unet, latent_model_input, t,
                         s_emb["pos"], s_emb["uncond"],
                         s_emb["added_pos"], s_emb["added_uncond"],
                         cfg_pos
@@ -244,9 +249,10 @@ class CARCPipeline:
             for name, eps_s in eps_subjects.items():
                 eps_final += eps_s * expand(masks_latent[name])
                 
+            # 【修复点 2】Step 依然使用原始 latents (非 scaled)
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
             
-            # Phase E: Update
+            # Phase E: Update Mask
             if do_probe:
                 attn_maps = self.attn_proc.pop_attn_maps()
                 maps_img = {}
