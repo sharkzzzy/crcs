@@ -13,7 +13,7 @@ def main():
         use_safetensors=True,
     ).to(device)
 
-    # 全 FP32 保证稳定
+    # 1. 强制 FP32
     base_pipe.vae.to(dtype=torch.float32)
     base_pipe.text_encoder.to(dtype=torch.float32)
     base_pipe.text_encoder_2.to(dtype=torch.float32)
@@ -22,7 +22,7 @@ def main():
     base_pipe.enable_vae_tiling()
     base_pipe.enable_vae_slicing()
 
-    # CARC 初始化：【关键】移除高分层注入，防止语义污染
+    # 2. 注入配置：低/中层注入
     inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0"]
     alpha_config = {
         "construct_phase": (0.0, 0.35, 0.15),
@@ -36,26 +36,26 @@ def main():
         inject_layer_patterns=inject_patterns
     )
 
-    # 提示词：背景全局，主体局部
-    global_bg = "in a sunny park with green grass and trees, cinematic lighting, high clarity"
-    global_prompt = f"A wide photo of a red cat and a blue dog {global_bg}"
+    # 3. 提示词策略 (Clean Global Prompt)
+    # 【关键】全局只画背景，绝对不提猫和狗！
+    global_prompt = "A wide cinematic photo of a sunny park with green grass and trees, blurred background, high clarity, 8k"
 
     subjects = [
         {
             "name": "cat",
-            "prompt": "a red cat, full body, fluffy, sharp details, left side, full face, clearly separated, not merged",
+            "prompt": "a red cat, full body, fluffy, sharp details, left side, full face, clearly separated",
             "position": "left",
             "neg_target": "blue dog, blue fur",
         },
         {
             "name": "dog",
-            "prompt": "a blue dog, full body, sharp details, right side, full face, clearly separated, not merged",
+            "prompt": "a blue dog, full body, sharp details, right side, full face, clearly separated",
             "position": "right",
             "neg_target": "red cat, red fur",
         }
     ]
 
-    print("Generating image with FP32 & CARC (Exclusive Masks & Differential Blending)...")
+    print("Generating image (Clean Background + Strict Isolation)...")
     seed = 2024
 
     result = carc_pipe(
@@ -66,20 +66,21 @@ def main():
         num_inference_steps=40,
 
         cfg_pos=7.0,
-        cfg_neg=3.0,          
+        cfg_neg=3.0,
 
         mask_update_interval=6,
         bg_update_interval=4,
 
         beta=0.6,
-        safety_expand=0.05,   # 【关键】极小的越界许可，配合 Gap Logic 彻底分开
-        kappa=1.5,            # 【关键】强力的差分融合，提取主体特征
+        safety_expand=0.05,   # 严防越界
+        gap_ratio=0.08,       # 初始留出 8% 的中缝
+        kappa=1.5,            # 强力差分
 
         seed=seed,
     )
 
     os.makedirs("outputs", exist_ok=True)
-    save_path = f"outputs/carc_fp32_separate_seed{seed}.png"
+    save_path = f"outputs/carc_final_clean_seed{seed}.png"
     save_output(result, save_path)
     print(f"Done. Saved to: {save_path}")
 
