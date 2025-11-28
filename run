@@ -4,22 +4,20 @@ from diffusers import StableDiffusionXLPipeline
 from pipeline_carc import CARCPipeline, save_output
 
 # ==============================================================================
-# 1. 配置与模型加载 (FP32 全精度模式)
+# 1. 配置与模型加载 (FP32 全精度模式 - 最稳)
 # ==============================================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
 print(f"🚀 Loading SDXL model in FP32 Mode...")
 try:
-    # 移除 torch_dtype=torch.float16，默认即为 float32
-    # 移除 variant="fp16"，确保加载默认权重（更稳定）
     base_pipe = StableDiffusionXLPipeline.from_pretrained(
         model_id,
         use_safetensors=True,
-        # local_files_only=True # 如果需要离线，取消注释
+        # local_files_only=True 
     ).to(device)
     
-    # 双重保险：确保所有组件都在 float32
+    # 强制全 FP32 防止黑图和溢出
     base_pipe.vae.to(dtype=torch.float32)
     base_pipe.text_encoder.to(dtype=torch.float32)
     base_pipe.text_encoder_2.to(dtype=torch.float32)
@@ -30,58 +28,71 @@ except Exception as e:
     exit(1)
 
 # ==============================================================================
-# 2. 初始化 CARC 引擎
+# 2. 初始化 CARC 引擎 (参数调优版)
 # ==============================================================================
-print("🔧 Initializing CARC Engine...")
+print("🔧 Initializing CARC Engine with Aggressive Injection...")
+
+# 【调优 1】增强注入强度，解决拼接生硬问题
 alpha_config = {
-    "construct_phase": (0.0, 0.35, 0.2), 
-    "texture_phase":   (0.35, 0.75, 0.8),
-    "refine_phase":    (0.75, 1.0, 0.5),
+    "construct_phase": (0.0, 0.4, 0.4),  # 早期就开始注入 (0.4)
+    "texture_phase":   (0.4, 0.8, 1.0),  # 中期拉满 (1.0)，强行统一光影
+    "refine_phase":    (0.8, 1.0, 0.6),  # 尾期保留 (0.6)
 }
+
+# 【调优 2】扩大注入范围，加回 up_blocks.1 (64x64)
+# 虽然增加了显存压力，但 FP32 下 24G 显存应该能扛住。这层对融合最重要。
+inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0", "up_blocks.1"]
 
 carc_pipe = CARCPipeline(
     base_pipe=base_pipe,
-    alpha_cfg=alpha_config
+    alpha_cfg=alpha_config,
+    inject_layer_patterns=inject_patterns
 )
 
 # ==============================================================================
 # 3. 定义生成任务
 # ==============================================================================
+# 提示词微调：强调全身，防止只画半个
 subjects = [
     {
         "name": "cat",
-        "prompt": "a red cat, high detail, fluffy",
+        "prompt": "a full body red cat sitting on grass, fluffy, photorealistic",
         "position": "left",
         "neg_target": "a blue dog"
     },
     {
         "name": "dog",
-        "prompt": "a blue dog, high detail",
+        "prompt": "a full body blue dog sitting on grass, photorealistic",
         "position": "right",
         "neg_target": "a red cat"
     }
 ]
 
-global_prompt = "A sunny park background with green grass and trees, cinematic lighting, 8k, photorealistic"
+global_prompt = "A sunny park background with green grass and trees, cinematic lighting, 8k, photorealistic, wide angle"
 
 # ==============================================================================
-# 4. 执行生成
+# 4. 执行生成 (参数调优版)
 # ==============================================================================
-print("🎨 Generating image (FP32 mode, this may take longer)...")
+print("🎨 Generating image (Tuned for Coherence)...")
 
-seed = 42
+seed = 12345 # 换个种子试试运气
 output = carc_pipe(
     global_prompt=global_prompt,
     subjects=subjects,
     width=1024,
     height=1024,
     num_inference_steps=40,
+    
     cfg_pos=7.5,
     cfg_neg=4.0,
-    mask_update_interval=5,
-    bg_update_interval=2, 
-    beta=0.7,
-    safety_expand=0.15,
+    
+    # 【调优 3】加快 Mask 更新，允许更大越界
+    mask_update_interval=2,    # 每2步就更新一次 Mask (原为5)
+    bg_update_interval=2,      # 背景也勤快点更新
+    
+    beta=0.6,                  # 降低动量 (原0.7)，让 Mask 变化更灵敏
+    safety_expand=0.35,        # 允许越界 35% (原0.15)，让猫狗能长过中线
+    
     seed=seed
 )
 
@@ -89,7 +100,7 @@ output = carc_pipe(
 # 5. 保存结果
 # ==============================================================================
 os.makedirs("outputs", exist_ok=True)
-save_path = f"outputs/carc_demo_fp32_seed{seed}.png"
+save_path = f"outputs/carc_tuned_seed{seed}.png"
 save_output(output, save_path)
 
 print(f"✅ Done! Image saved to: {save_path}")
