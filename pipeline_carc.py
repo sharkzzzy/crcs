@@ -1,14 +1,9 @@
-"""
-pipeline_carc.py
-FINAL V5: Fixes Missing 'scale_model_input' (Cause of Black Image).
-"""
-
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
 
-# Explicit imports
+# Imports
 from .attention_processor import (
     CARCAttentionProcessor, ContextBank, AlphaScheduler, LayerSelector,
 )
@@ -34,8 +29,8 @@ def _prepare_latents(batch_size, channels, height, width, dtype, device, schedul
 def _decode_vae(vae, latents: torch.Tensor) -> torch.Tensor:
     # 1. 缩放
     latents = latents / vae.config.scaling_factor
-    # 2. 强制转 float32 防止溢出黑图
-    latents = latents.to(dtype=torch.float32)
+    # 2. 跟随 VAE 精度 (避免 fp32 vs fp16 冲突)
+    latents = latents.to(dtype=vae.dtype)
     # 3. 解码
     with torch.no_grad():
         image = vae.decode(latents).sample
@@ -104,7 +99,9 @@ class CARCPipeline:
         target_size = (height, width)
         crops_coords_top_left = (0, 0)
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids], dtype=self.dtype, device=self.device)
+        
+        # 【修改点 1】Time IDs 强制 float32 以保证精度
+        add_time_ids = torch.tensor([add_time_ids], dtype=torch.float32, device=self.device)
         
         def pack_cond(pos_emb, neg_emb, pos_pool, neg_pool):
             return {
@@ -158,14 +155,12 @@ class CARCPipeline:
     ):
         _seed_everything(seed)
         
-        # Init
         embs = self._prepare_embeddings(global_prompt, subjects, width, height)
         self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
         
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
         
-        # Latents Init (Use Latent Size 128)
         latent_h, latent_w = height // 8, width // 8
         latents = _prepare_latents(
             1, 4, latent_h, latent_w, self.dtype, self.device, self.scheduler,
@@ -179,11 +174,9 @@ class CARCPipeline:
 
         self.attn_proc.set_base_latent_hw(latent_h, latent_w)
         
-        # Loop
         for i, t in enumerate(timesteps):
             self.attn_proc.set_step_index(i, num_inference_steps)
             
-            # 【修复点 1】必须缩放 Latents！
             latent_model_input = self.scheduler.scale_model_input(latents, t)
             
             # Phase A: Background Record
@@ -191,7 +184,6 @@ class CARCPipeline:
                 self.context_bank.clear()
                 self.attn_proc.set_mode("record_bg")
                 self.attn_proc.set_probe_enabled(False)
-                # 使用 scaled input
                 _unet_forward(
                     self.unet, latent_model_input, t, 
                     embs["global"]["pos"], embs["global"]["added_pos"]
@@ -249,19 +241,20 @@ class CARCPipeline:
             for name, eps_s in eps_subjects.items():
                 eps_final += eps_s * expand(masks_latent[name])
                 
-            # 【修复点 2】Step 依然使用原始 latents (非 scaled)
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
             
-            # Phase E: Update Mask
+            # Phase E: Update
             if do_probe:
                 attn_maps = self.attn_proc.pop_attn_maps()
                 maps_img = {}
                 for sid, amap in attn_maps.items():
                     name = subjects[sid]["name"]
-                    maps_img[name] = F.interpolate(amap, size=(height, width), mode="bilinear")
+                    # 【修改点 3】显式 align_corners=False
+                    maps_img[name] = F.interpolate(amap, size=(height, width), mode="bilinear", align_corners=False)
                 if maps_img:
                     mask_mgr.update_from_attn(maps_img)
 
+        # 【修改点 2】Decode 使用 VAE 自身 dtype
         image = _decode_vae(self.vae, latents)
         return {"image": image}
 
