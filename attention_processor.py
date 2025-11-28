@@ -266,15 +266,22 @@ class CARCAttentionProcessor(nn.Module):
                 # Concat along sequence dim
                 key = torch.cat([key, alpha_val * K_bg], dim=1)
                 value = torch.cat([value, alpha_val * V_bg], dim=1)
-                
-                # Extend Mask
+          
                 if attention_mask is not None:
+                    # attention_mask 可能是 [B, 1, Lq, Lk] 或 [B*H, Lq, Lk]
+                    # 我们只需要在最后一维 (Key维) 增加 bg_len 长度的 0 (允许关注)
                     bg_len = K_bg.shape[1]
-                    padding = list(attention_mask.shape)
-                    padding[-1] = bg_len
-                    mask_bg = torch.zeros(padding, device=attention_mask.device, dtype=attention_mask.dtype)
+                    
+                    # 获取除最后一维外的所有维度形状
+                    prefix_shape = list(attention_mask.shape[:-1])
+                    new_shape = prefix_shape + [bg_len]
+                    
+                    # 创建全0扩展 (0表示keep, 很大的负数表示mask)
+                    # 注意：diffusers 的 mask 有时是 boolean，有时是 float (0/-inf)
+                    # 我们这里假设它已经是 float 格式
+                    mask_bg = torch.zeros(new_shape, device=attention_mask.device, dtype=attention_mask.dtype)
+                    
                     attention_mask = torch.cat([attention_mask, mask_bg], dim=-1)
-
         # Scale
         scale = getattr(attn, "scale", None)
         if scale is None: scale = 1.0 / math.sqrt(query.shape[-1])
@@ -296,3 +303,8 @@ class CARCAttentionProcessor(nn.Module):
 
 def create_carc_attention_processor(context_bank=None, alpha_scheduler=None, layer_selector=None):
     return CARCAttentionProcessor(context_bank, alpha_scheduler, layer_selector)
+
+
+
+
+base_pipe.enable_model_cpu_offload() 
