@@ -1,16 +1,20 @@
+"""
+pipeline_carc.py
+FINAL V9: Differential Blending & Enhanced Params.
+"""
 
 from typing import Any, Dict, List, Optional, Tuple
 import torch
-import torch.nn.functional as F
 from torchvision.utils import save_image
+import torch.nn.functional as F
 
-from attention_processor import (
+from .attention_processor import (
     CARCAttentionProcessor, ContextBank, AlphaScheduler, LayerSelector,
 )
-from guidance import (
+from .guidance import (
     compute_contrastive_cfg, compute_cfg, prepare_timesteps, _unet_forward
 )
-from mask_manager import DynamicMaskManager
+from .mask_manager import DynamicMaskManager
 
 def _seed_everything(seed: int):
     import random, numpy as np
@@ -144,15 +148,14 @@ class CARCPipeline:
         mask_update_interval: int = 5,
         bg_update_interval: int = 2,
         beta: float = 0.7,
-        safety_expand: float = 0.15,
+        safety_expand: float = 0.05,
         seed: int = 42,
-        kappa: float = 1.3, # 【新参数】差分增强系数
+        kappa: float = 1.5, # 【关键】差分融合系数
     ):
         _seed_everything(seed)
         
         embs = self._prepare_embeddings(global_prompt, subjects, width, height)
         self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
-        
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
         
@@ -173,14 +176,13 @@ class CARCPipeline:
             self.attn_proc.set_step_index(i, num_inference_steps)
             latent_model_input = self.scheduler.scale_model_input(latents, t)
             
-            # Phase A: Background Record
+            # Phase A: Background
             if i % bg_update_interval == 0:
                 self.context_bank.clear()
                 self.attn_proc.set_mode("record_bg")
                 self.attn_proc.set_probe_enabled(False)
                 _unet_forward(self.unet, latent_model_input, t, embs["global"]["pos"], embs["global"]["added_pos"])
             
-            # Phase B: Background Noise
             self.attn_proc.set_mode("off")
             eps_bg = compute_cfg(
                 self.unet, latent_model_input, t, 
@@ -197,16 +199,13 @@ class CARCPipeline:
                 self.attn_proc.set_subject_id(sid)
                 s_emb = embs[name]
                 
-                # C.1 Probe
                 if do_probe:
                     self.attn_proc.set_mode("inject_subject")
                     self.attn_proc.set_probe_enabled(True)
                     _unet_forward(self.unet, latent_model_input, t, s_emb["pos"], s_emb["added_pos"])
                 
-                # C.2 Noise
                 self.attn_proc.set_mode("inject_subject")
                 self.attn_proc.set_probe_enabled(False)
-                
                 if s_emb["neg_target"] is not None:
                     eps_sub = compute_contrastive_cfg(
                         self.unet, latent_model_input, t,
@@ -223,15 +222,15 @@ class CARCPipeline:
                     )
                 eps_subjects[name] = eps_sub
 
-            # Phase D: Composition (Differential Blending)
+            # Phase D: Compose (Differential)
             masks_latent, bg_mask_latent = mask_mgr.get_masks_latent()
             def expand(m): return m.expand(latents.shape[0], 4, -1, -1)
             
-            # 【核心修改】差分融合公式
+            # 【关键】差分融合公式
             eps_final = eps_bg 
             for name, eps_s in eps_subjects.items():
                 w = expand(masks_latent[name])
-                # 增强主体特有细节，减去背景共性
+                # eps_bg + kappa * w * (eps_s - eps_bg)
                 eps_final = eps_final + kappa * w * (eps_s - eps_bg)
                 
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
