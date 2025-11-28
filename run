@@ -4,7 +4,7 @@ from diffusers import StableDiffusionXLPipeline
 from pipeline_carc import CARCPipeline, save_output
 
 # ==============================================================================
-# 1. 配置与模型加载 (FP32 全精度模式 - 最稳)
+# 1. 加载模型 (FP32 Mode)
 # ==============================================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_id = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -14,10 +14,9 @@ try:
     base_pipe = StableDiffusionXLPipeline.from_pretrained(
         model_id,
         use_safetensors=True,
-        # local_files_only=True 
     ).to(device)
     
-    # 强制全 FP32 防止黑图和溢出
+    # Force FP32 Components
     base_pipe.vae.to(dtype=torch.float32)
     base_pipe.text_encoder.to(dtype=torch.float32)
     base_pipe.text_encoder_2.to(dtype=torch.float32)
@@ -28,19 +27,18 @@ except Exception as e:
     exit(1)
 
 # ==============================================================================
-# 2. 初始化 CARC 引擎 (参数调优版)
+# 2. 初始化 CARC 引擎
 # ==============================================================================
-print("🔧 Initializing CARC Engine with Aggressive Injection...")
+print("🔧 Initializing CARC Engine (Math-Corrected Masking)...")
 
-# 【调优 1】增强注入强度，解决拼接生硬问题
+# 注入配置：保持强力，确保光影统一
 alpha_config = {
-    "construct_phase": (0.0, 0.4, 0.4),  # 早期就开始注入 (0.4)
-    "texture_phase":   (0.4, 0.8, 1.0),  # 中期拉满 (1.0)，强行统一光影
-    "refine_phase":    (0.8, 1.0, 0.6),  # 尾期保留 (0.6)
+    "construct_phase": (0.0, 0.4, 0.5), 
+    "texture_phase":   (0.4, 0.8, 1.0), 
+    "refine_phase":    (0.8, 1.0, 0.6), 
 }
 
-# 【调优 2】扩大注入范围，加回 up_blocks.1 (64x64)
-# 虽然增加了显存压力，但 FP32 下 24G 显存应该能扛住。这层对融合最重要。
+# 注入层
 inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0", "up_blocks.1"]
 
 carc_pipe = CARCPipeline(
@@ -50,32 +48,36 @@ carc_pipe = CARCPipeline(
 )
 
 # ==============================================================================
-# 3. 定义生成任务
+# 3. 提示词策略 (Context Sharing)
 # ==============================================================================
-# 提示词微调：强调全身，防止只画半个
+bg_suffix = "in a beautiful sunny park with green grass, blurred background, cinematic lighting, 8k"
+
 subjects = [
     {
         "name": "cat",
-        "prompt": "a full body red cat sitting on grass, fluffy, photorealistic",
+        # 提示词强调 "全身"，防止只画头
+        "prompt": f"a red cat sitting on the grass, full body, fluffy, {bg_suffix}", 
         "position": "left",
-        "neg_target": "a blue dog"
+        "neg_target": "blue dog"
     },
     {
         "name": "dog",
-        "prompt": "a full body blue dog sitting on grass, photorealistic",
+        "prompt": f"a blue dog sitting on the grass, full body, {bg_suffix}",
         "position": "right",
-        "neg_target": "a red cat"
+        "neg_target": "red cat"
     }
 ]
 
-global_prompt = "A sunny park background with green grass and trees, cinematic lighting, 8k, photorealistic, wide angle"
+global_prompt = f"A wide photo of a red cat and a blue dog, {bg_suffix}"
 
 # ==============================================================================
-# 4. 执行生成 (参数调优版)
+# 4. 执行生成 (Final Verified Params)
 # ==============================================================================
-print("🎨 Generating image (Tuned for Coherence)...")
+print("🎨 Generating image (Dynamic Mask Enabled)...")
 
-seed = 12345 # 换个种子试试运气
+# 种子 2024 在之前的测试中构图不错
+seed = 2024 
+
 output = carc_pipe(
     global_prompt=global_prompt,
     subjects=subjects,
@@ -83,24 +85,27 @@ output = carc_pipe(
     height=1024,
     num_inference_steps=40,
     
+    # 引导强度
     cfg_pos=7.5,
-    cfg_neg=4.0,
+    cfg_neg=3.0,   # 适度互斥，保证颜色不串，又不破坏结构
     
-    # 【调优 3】加快 Mask 更新，允许更大越界
-    mask_update_interval=2,    # 每2步就更新一次 Mask (原为5)
-    bg_update_interval=2,      # 背景也勤快点更新
+    # Mask 策略 (核心改动)
+    mask_update_interval=5,    # 开启动态更新！现在 Mask 逻辑修好了，可以让它自适应了
+    bg_update_interval=2,      
     
-    beta=0.6,                  # 降低动量 (原0.7)，让 Mask 变化更灵敏
-    safety_expand=0.35,        # 允许越界 35% (原0.15)，让猫狗能长过中线
+    # Mask 参数 (配合新的 mask_manager)
+    beta=0.7,                  # 动量 0.7，保持稳定
+    safety_expand=0.2,         # 允许 20% 越界
     
     seed=seed
 )
 
 # ==============================================================================
-# 5. 保存结果
+# 5. 保存
 # ==============================================================================
 os.makedirs("outputs", exist_ok=True)
-save_path = f"outputs/carc_tuned_seed{seed}.png"
+save_path = f"outputs/carc_final_seed{seed}.png"
 save_output(output, save_path)
 
 print(f"✅ Done! Image saved to: {save_path}")
+print("Expectation: Separated Red Cat / Blue Dog, unified background, no hard seam.")
