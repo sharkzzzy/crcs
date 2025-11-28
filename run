@@ -1,8 +1,9 @@
-# 运行这个找路径
-from huggingface_hub import snapshot_download
-
-try:
-    path = snapshot_download(repo_id="stabilityai/stable-diffusion-xl-base-1.0", local_files_only=True)
-    print(f"模型在：{path}")
-except:
-    print("本地确实找不到，看来真的得下载...")
+🎨 Generating image (this may take a minute)...
+Traceback (most recent call last):
+  File "/home/linux/PycharmProjects/pythonProject/new project/run_carc_demo.py", line 70, in <module>
+    output = carc_pipe(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/linux/PycharmProjects/pythonProject/new project/pipeline_carc.py", line 232, in __call__
+    _unet_forward(
+NameError: name '_unet_forward' is not defined
