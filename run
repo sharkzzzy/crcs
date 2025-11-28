@@ -1,0 +1,97 @@
+run_carc_demo.py
+python
+import torch
+import os
+from diffusers import StableDiffusionXLPipeline
+from pipeline_carc import CARCPipeline, save_output
+
+# ==============================================================================
+# 1. 配置与模型加载
+# ==============================================================================
+# 强制使用离线模式（如果模型已下载）
+# os.environ["HF_HUB_OFFLINE"] = "1"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# 使用标准 SDXL Base 1.0
+model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+
+print(f"🚀 Loading SDXL model from {model_id}...")
+try:
+    base_pipe = StableDiffusionXLPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        variant="fp16" if device == "cuda" else None,
+        use_safetensors=True
+    ).to(device)
+except Exception as e:
+    print(f"Error loading model: {e}")
+    print("Tip: If running offline, make sure the model is cached or set 'local_files_only=True'")
+    exit(1)
+
+# ==============================================================================
+# 2. 初始化 CARC 引擎
+# ==============================================================================
+print("🔧 Initializing CARC Engine...")
+# Alpha 调度配置：构图期弱注入，纹理期强注入，收尾期中等
+alpha_config = {
+    "construct_phase": (0.0, 0.35, 0.2),  # 0-35%: 0.2
+    "texture_phase":   (0.35, 0.75, 0.8), # 35-75%: 0.8
+    "refine_phase":    (0.75, 1.0, 0.5),  # 75-100%: 0.5
+}
+
+carc_pipe = CARCPipeline(
+    base_pipe=base_pipe,
+    alpha_cfg=alpha_config
+)
+
+# ==============================================================================
+# 3. 定义生成任务 (The "Impossible" Prompt)
+# ==============================================================================
+# 目标：左边红猫，右边蓝狗，互不串色，光影统一
+subjects = [
+    {
+        "name": "cat",
+        "prompt": "a red cat, high detail, fluffy",
+        "position": "left",
+        "neg_target": "a blue dog"  # <--- 语义互斥：生成猫时，排斥狗的特征
+    },
+    {
+        "name": "dog",
+        "prompt": "a blue dog, high detail",
+        "position": "right",
+        "neg_target": "a red cat"   # <--- 语义互斥
+    }
+]
+
+global_prompt = "A sunny park background with green grass and trees, cinematic lighting, 8k, photorealistic"
+
+# ==============================================================================
+# 4. 执行生成
+# ==============================================================================
+print("🎨 Generating image (this may take a minute)...")
+
+seed = 42  # 固定种子以便复现
+output = carc_pipe(
+    global_prompt=global_prompt,
+    subjects=subjects,
+    width=1024,
+    height=1024,
+    num_inference_steps=40,    # SDXL 标准步数
+    cfg_pos=7.5,               # 正向引导强度
+    cfg_neg=4.0,               # 互斥引导强度 (建议 2.0 - 5.0)
+    mask_update_interval=5,    # 每5步根据 Attention 更新一次 Mask
+    bg_update_interval=5,      # 每5步更新一次背景 KV (优化速度)
+    beta=0.7,                  # Mask 动量 (0.7 代表保留 70% 的历史形状)
+    safety_expand=0.15,        # 允许 Mask 越界 15%
+    seed=seed
+)
+
+# ==============================================================================
+# 5. 保存结果
+# ==============================================================================
+os.makedirs("outputs", exist_ok=True)
+save_path = f"outputs/carc_demo_seed{seed}.png"
+save_output(output, save_path)
+
+print(f"✅ Done! Image saved to: {save_path}")
+print("Check if the cat is RED and the dog is BLUE without color bleeding.")
