@@ -1,6 +1,6 @@
 """
 pipeline_carc.py
-FINAL V9: Differential Blending & Enhanced Params.
+FINAL V10: Fixes Parameter Passing to MaskManager.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -147,15 +147,21 @@ class CARCPipeline:
         cfg_neg: float = 3.0,
         mask_update_interval: int = 5,
         bg_update_interval: int = 2,
-        beta: float = 0.7,
+        
+        # Mask Hyperparameters
+        beta: float = 0.6,
         safety_expand: float = 0.05,
+        bg_floor: float = 0.05,
+        gap_ratio: float = 0.06,
+        
+        kappa: float = 1.5,
         seed: int = 42,
-        kappa: float = 1.5, # 【关键】差分融合系数
     ):
         _seed_everything(seed)
         
         embs = self._prepare_embeddings(global_prompt, subjects, width, height)
         self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
+        
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
         
@@ -165,10 +171,19 @@ class CARCPipeline:
             generator=torch.Generator(device=self.device).manual_seed(seed)
         )
         
+        # 【关键修复】将参数正确传递给 MaskManager
         mask_mgr = DynamicMaskManager.init_from_positions(
-            (height, width), (latent_h, latent_w), subjects, safety_expand, 
+            (height, width), (latent_h, latent_w), subjects, 
+            safety_expand=safety_expand, 
+            bg_floor=bg_floor,
+            gap_ratio=gap_ratio,
             device=self.device, dtype=self.dtype
         )
+        # 传递 beta (注意：DynamicMaskManager 实例创建后手动设置属性，或者 init_from_positions 应该透传)
+        # V9 mask_manager 没在 init_from_positions 接收 beta? 
+        # 让我检查 V9 mask_manager... 好像确实漏了透传 beta。
+        # 这里我们手动设置一下
+        mask_mgr.beta = beta
 
         self.attn_proc.set_base_latent_hw(latent_h, latent_w)
         
@@ -222,15 +237,13 @@ class CARCPipeline:
                     )
                 eps_subjects[name] = eps_sub
 
-            # Phase D: Compose (Differential)
+            # Phase D: Differential Blending
             masks_latent, bg_mask_latent = mask_mgr.get_masks_latent()
             def expand(m): return m.expand(latents.shape[0], 4, -1, -1)
             
-            # 【关键】差分融合公式
             eps_final = eps_bg 
             for name, eps_s in eps_subjects.items():
                 w = expand(masks_latent[name])
-                # eps_bg + kappa * w * (eps_s - eps_bg)
                 eps_final = eps_final + kappa * w * (eps_s - eps_bg)
                 
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
