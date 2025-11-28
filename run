@@ -30,16 +30,14 @@ except Exception as e:
 # 2. 初始化 CARC 引擎
 # ==============================================================================
 print("🔧 Initializing CARC Engine (Math-Corrected Masking)...")
-
-# 注入配置：保持强力，确保光影统一
 alpha_config = {
-    "construct_phase": (0.0, 0.4, 0.5), 
-    "texture_phase":   (0.4, 0.8, 1.0), 
-    "refine_phase":    (0.8, 1.0, 0.6), 
+    "construct_phase": (0.0, 0.35, 0.15),
+    "texture_phase":   (0.35, 0.75, 0.6),
+    "refine_phase":    (0.75, 1.0, 0.45),
 }
 
-# 注入层
-inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0", "up_blocks.1"]
+# 【优化】只在高分层微调 (up.2)，避开中间层 (up.1) 的过度干扰
+inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0", "up_blocks.2"]
 
 carc_pipe = CARCPipeline(
     base_pipe=base_pipe,
@@ -48,36 +46,33 @@ carc_pipe = CARCPipeline(
 )
 
 # ==============================================================================
-# 3. 提示词策略 (Context Sharing)
+# 3. 提示词策略 (分离背景与主体)
 # ==============================================================================
-bg_suffix = "in a beautiful sunny park with green grass, blurred background, cinematic lighting, 8k"
+# 全局：负责画环境
+global_prompt = "A wide cinematic photo of a red cat and a blue dog in a sunny park with green grass, blurred background, 8k, photorealistic, masterpiece"
 
+# 主体：只负责画自己，不重复背景词 -> 提升细节锐度
 subjects = [
     {
         "name": "cat",
-        # 提示词强调 "全身"，防止只画头
-        "prompt": f"a red cat sitting on the grass, full body, fluffy, {bg_suffix}", 
+        "prompt": "a red cat, full body, fluffy fur, sharp detailed face, bright eyes, sitting pose, left side", 
         "position": "left",
         "neg_target": "blue dog"
     },
     {
         "name": "dog",
-        "prompt": f"a blue dog sitting on the grass, full body, {bg_suffix}",
+        "prompt": "a blue dog, full body, sharp detailed face, bright eyes, sitting pose, right side",
         "position": "right",
         "neg_target": "red cat"
     }
 ]
 
-global_prompt = f"A wide photo of a red cat and a blue dog, {bg_suffix}"
-
 # ==============================================================================
-# 4. 执行生成 (Final Verified Params)
+# 4. 执行生成
 # ==============================================================================
-print("🎨 Generating image (Dynamic Mask Enabled)...")
+print("🎨 Generating image...")
 
-# 种子 2024 在之前的测试中构图不错
-seed = 2024 
-
+seed = 2024
 output = carc_pipe(
     global_prompt=global_prompt,
     subjects=subjects,
@@ -85,17 +80,15 @@ output = carc_pipe(
     height=1024,
     num_inference_steps=40,
     
-    # 引导强度
     cfg_pos=7.5,
-    cfg_neg=3.0,   # 适度互斥，保证颜色不串，又不破坏结构
+    cfg_neg=3.0,
+    kappa=1.3,     # 差分增强，进一步锐化
     
-    # Mask 策略 (核心改动)
-    mask_update_interval=5,    # 开启动态更新！现在 Mask 逻辑修好了，可以让它自适应了
-    bg_update_interval=2,      
+    mask_update_interval=5,
+    bg_update_interval=2,
     
-    # Mask 参数 (配合新的 mask_manager)
-    beta=0.7,                  # 动量 0.7，保持稳定
-    safety_expand=0.2,         # 允许 20% 越界
+    beta=0.7,
+    safety_expand=0.2,
     
     seed=seed
 )
@@ -104,8 +97,7 @@ output = carc_pipe(
 # 5. 保存
 # ==============================================================================
 os.makedirs("outputs", exist_ok=True)
-save_path = f"outputs/carc_final_seed{seed}.png"
+save_path = f"outputs/carc_fp32_opt_seed{seed}.png"
 save_output(output, save_path)
 
 print(f"✅ Done! Image saved to: {save_path}")
-print("Expectation: Separated Red Cat / Blue Dog, unified background, no hard seam.")
