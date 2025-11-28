@@ -1,16 +1,16 @@
+
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
 
-# Imports
-from .attention_processor import (
+from attention_processor import (
     CARCAttentionProcessor, ContextBank, AlphaScheduler, LayerSelector,
 )
-from .guidance import (
+from guidance import (
     compute_contrastive_cfg, compute_cfg, prepare_timesteps, _unet_forward
 )
-from .mask_manager import DynamicMaskManager
+from mask_manager import DynamicMaskManager
 
 def _seed_everything(seed: int):
     import random, numpy as np
@@ -27,11 +27,8 @@ def _prepare_latents(batch_size, channels, height, width, dtype, device, schedul
     return latents
 
 def _decode_vae(vae, latents: torch.Tensor) -> torch.Tensor:
-    # 1. 缩放
     latents = latents / vae.config.scaling_factor
-    # 2. 跟随 VAE 精度 (避免 fp32 vs fp16 冲突)
     latents = latents.to(dtype=vae.dtype)
-    # 3. 解码
     with torch.no_grad():
         image = vae.decode(latents).sample
     image = (image / 2 + 0.5).clamp(0, 1)
@@ -99,8 +96,6 @@ class CARCPipeline:
         target_size = (height, width)
         crops_coords_top_left = (0, 0)
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
-        
-        # 【修改点 1】Time IDs 强制 float32 以保证精度
         add_time_ids = torch.tensor([add_time_ids], dtype=torch.float32, device=self.device)
         
         def pack_cond(pos_emb, neg_emb, pos_pool, neg_pool):
@@ -126,7 +121,6 @@ class CARCPipeline:
             else:
                 embs[name] = pack_cond(spe, sne, spp, snp)
                 embs[name]["neg_target"] = None
-                
         return embs
 
     def _get_subject_token_ids(self, subjects):
@@ -152,6 +146,7 @@ class CARCPipeline:
         beta: float = 0.7,
         safety_expand: float = 0.15,
         seed: int = 42,
+        kappa: float = 1.3, # 【新参数】差分增强系数
     ):
         _seed_everything(seed)
         
@@ -176,7 +171,6 @@ class CARCPipeline:
         
         for i, t in enumerate(timesteps):
             self.attn_proc.set_step_index(i, num_inference_steps)
-            
             latent_model_input = self.scheduler.scale_model_input(latents, t)
             
             # Phase A: Background Record
@@ -184,10 +178,7 @@ class CARCPipeline:
                 self.context_bank.clear()
                 self.attn_proc.set_mode("record_bg")
                 self.attn_proc.set_probe_enabled(False)
-                _unet_forward(
-                    self.unet, latent_model_input, t, 
-                    embs["global"]["pos"], embs["global"]["added_pos"]
-                )
+                _unet_forward(self.unet, latent_model_input, t, embs["global"]["pos"], embs["global"]["added_pos"])
             
             # Phase B: Background Noise
             self.attn_proc.set_mode("off")
@@ -201,7 +192,6 @@ class CARCPipeline:
             # Phase C: Subjects
             do_probe = (i % mask_update_interval == 0)
             eps_subjects = {}
-            
             for sid, subj in enumerate(subjects):
                 name = subj["name"]
                 self.attn_proc.set_subject_id(sid)
@@ -233,13 +223,16 @@ class CARCPipeline:
                     )
                 eps_subjects[name] = eps_sub
 
-            # Phase D: Compose
+            # Phase D: Composition (Differential Blending)
             masks_latent, bg_mask_latent = mask_mgr.get_masks_latent()
             def expand(m): return m.expand(latents.shape[0], 4, -1, -1)
             
-            eps_final = eps_bg * expand(bg_mask_latent)
+            # 【核心修改】差分融合公式
+            eps_final = eps_bg 
             for name, eps_s in eps_subjects.items():
-                eps_final += eps_s * expand(masks_latent[name])
+                w = expand(masks_latent[name])
+                # 增强主体特有细节，减去背景共性
+                eps_final = eps_final + kappa * w * (eps_s - eps_bg)
                 
             latents = self.scheduler.step(eps_final, t, latents).prev_sample
             
@@ -249,12 +242,10 @@ class CARCPipeline:
                 maps_img = {}
                 for sid, amap in attn_maps.items():
                     name = subjects[sid]["name"]
-                    # 【修改点 3】显式 align_corners=False
                     maps_img[name] = F.interpolate(amap, size=(height, width), mode="bilinear", align_corners=False)
                 if maps_img:
                     mask_mgr.update_from_attn(maps_img)
 
-        # 【修改点 2】Decode 使用 VAE 自身 dtype
         image = _decode_vae(self.vae, latents)
         return {"image": image}
 
