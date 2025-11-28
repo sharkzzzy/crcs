@@ -1,70 +1,95 @@
-Traceback (most recent call last):
-  File "/home/linux/PycharmProjects/pythonProject/new project/run_carc_demo.py", line 73, in <module>
-    output = carc_pipe(
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
-    return func(*args, **kwargs)
-  File "/home/linux/PycharmProjects/pythonProject/new project/pipeline_carc.py", line 261, in __call__
-    image = _decode_vae(self.vae, latents)
-  File "/home/linux/PycharmProjects/pythonProject/new project/pipeline_carc.py", line 37, in _decode_vae
-    image = vae.decode(latents).sample
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/utils/accelerate_utils.py", line 46, in wrapper
-    return method(self, *args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/autoencoders/autoencoder_kl.py", line 323, in decode
-    decoded = self._decode(z).sample
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/autoencoders/autoencoder_kl.py", line 292, in _decode
-    z = self.post_quant_conv(z)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 458, in forward
-    return self._conv_forward(input, self.weight, self.bias)
-  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 454, in _conv_forward
-    return F.conv2d(input, weight, bias, self.stride,
-RuntimeError: Input type (float) and bias type (c10::Half) should be the same
+import torch
+import os
+from diffusers import StableDiffusionXLPipeline
+from pipeline_carc import CARCPipeline, save_output
 
+# ==============================================================================
+# 1. 配置与模型加载 (FP32 全精度模式)
+# ==============================================================================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
+print(f"🚀 Loading SDXL model in FP32 Mode...")
+try:
+    # 移除 torch_dtype=torch.float16，默认即为 float32
+    # 移除 variant="fp16"，确保加载默认权重（更稳定）
+    base_pipe = StableDiffusionXLPipeline.from_pretrained(
+        model_id,
+        use_safetensors=True,
+        # local_files_only=True # 如果需要离线，取消注释
+    ).to(device)
+    
+    # 双重保险：确保所有组件都在 float32
+    base_pipe.vae.to(dtype=torch.float32)
+    base_pipe.text_encoder.to(dtype=torch.float32)
+    base_pipe.text_encoder_2.to(dtype=torch.float32)
+    base_pipe.unet.to(dtype=torch.float32)
+    
+except Exception as e:
+    print(f"Error loading model: {e}")
+    exit(1)
 
-Generating image (this may take a minute)...
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-The `scale_model_input` function should be called before `step` to ensure correct denoising. See `StableDiffusionPipeline` for a usage example.
-✅ Done! Image saved to: outputs/carc_demo_seed42.png
-Check if the cat is RED and the dog is BLUE without color bleeding.
+# ==============================================================================
+# 2. 初始化 CARC 引擎
+# ==============================================================================
+print("🔧 Initializing CARC Engine...")
+alpha_config = {
+    "construct_phase": (0.0, 0.35, 0.2), 
+    "texture_phase":   (0.35, 0.75, 0.8),
+    "refine_phase":    (0.75, 1.0, 0.5),
+}
+
+carc_pipe = CARCPipeline(
+    base_pipe=base_pipe,
+    alpha_cfg=alpha_config
+)
+
+# ==============================================================================
+# 3. 定义生成任务
+# ==============================================================================
+subjects = [
+    {
+        "name": "cat",
+        "prompt": "a red cat, high detail, fluffy",
+        "position": "left",
+        "neg_target": "a blue dog"
+    },
+    {
+        "name": "dog",
+        "prompt": "a blue dog, high detail",
+        "position": "right",
+        "neg_target": "a red cat"
+    }
+]
+
+global_prompt = "A sunny park background with green grass and trees, cinematic lighting, 8k, photorealistic"
+
+# ==============================================================================
+# 4. 执行生成
+# ==============================================================================
+print("🎨 Generating image (FP32 mode, this may take longer)...")
+
+seed = 42
+output = carc_pipe(
+    global_prompt=global_prompt,
+    subjects=subjects,
+    width=1024,
+    height=1024,
+    num_inference_steps=40,
+    cfg_pos=7.5,
+    cfg_neg=4.0,
+    mask_update_interval=5,
+    bg_update_interval=2, 
+    beta=0.7,
+    safety_expand=0.15,
+    seed=seed
+)
+
+# ==============================================================================
+# 5. 保存结果
+# ==============================================================================
+os.makedirs("outputs", exist_ok=True)
+save_path = f"outputs/carc_demo_fp32_seed{seed}.png"
+save_output(output, save_path)
+
+print(f"✅ Done! Image saved to: {save_path}")
