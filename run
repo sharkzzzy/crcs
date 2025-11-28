@@ -6,27 +6,38 @@ from pipeline_carc import CARCPipeline, save_output
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-    print(f"Loading SDXL Base in FP32 on {device}...")
+    print(f"🚀 Loading SDXL Base in FP32 on {device}...")
 
-    base_pipe = StableDiffusionXLPipeline.from_pretrained(
-        model_id,
-        use_safetensors=True,
-    ).to(device)
+    try:
+        base_pipe = StableDiffusionXLPipeline.from_pretrained(
+            model_id,
+            use_safetensors=True,
+        ).to(device)
 
-    # 1. 强制 FP32
-    base_pipe.vae.to(dtype=torch.float32)
-    base_pipe.text_encoder.to(dtype=torch.float32)
-    base_pipe.text_encoder_2.to(dtype=torch.float32)
-    base_pipe.unet.to(dtype=torch.float32)
+        # 1. 强制全 FP32 (最稳)
+        base_pipe.vae.to(dtype=torch.float32)
+        base_pipe.text_encoder_2.to(dtype=torch.float32)
+        base_pipe.unet.to(dtype=torch.float32)
 
-    base_pipe.enable_vae_tiling()
-    base_pipe.enable_vae_slicing()
+        # 2. 显存优化 (可选，根据显存情况)
+        print("🔧 Enabling VAE Tiling & Slicing...")
+        base_pipe.enable_vae_tiling()
+        base_pipe.enable_vae_slicing()
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        exit(1)
 
-    # 2. 注入配置：低/中层注入
+    # ==========================================================================
+    # CARC 初始化
+    # ==========================================================================
+    # 注入层：包含低/中层，避开极高分层 (up.1/up.2) 防止语义错乱
+    # up_blocks.0 是 32x32，是核心层，必须保留
     inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0"]
+    
     alpha_config = {
         "construct_phase": (0.0, 0.35, 0.15),
-        "texture_phase":   (0.35, 0.75, 0.55),
+        "texture_phase":   (0.35, 0.75, 0.6), # 中段强度适中
         "refine_phase":    (0.75, 1.0, 0.45),
     }
 
@@ -36,26 +47,33 @@ def main():
         inject_layer_patterns=inject_patterns
     )
 
-    # 3. 提示词策略 (Clean Global Prompt)
-    # 【关键】全局只画背景，绝对不提猫和狗！
-    global_prompt = "A wide cinematic photo of a sunny park with green grass and trees, blurred background, high clarity, 8k"
+    # ==========================================================================
+    # 提示词策略 (Clean Global + Strong Local)
+    # ==========================================================================
+    # 全局：纯背景，绝对不提猫狗，防止生成底图怪物
+    global_bg = "in a sunny park with green grass and trees, blurred background, cinematic lighting, 8k, photorealistic"
+    global_prompt = f"A wide photo of a park scene, {global_bg}"
 
     subjects = [
         {
             "name": "cat",
-            "prompt": "a red cat, full body, fluffy, sharp details, left side, full face, clearly separated",
+            # 强调独立性
+            "prompt": "a red cat sitting, full body, fluffy, sharp details, left side, clearly separated",
             "position": "left",
             "neg_target": "blue dog, blue fur",
         },
         {
             "name": "dog",
-            "prompt": "a blue dog, full body, sharp details, right side, full face, clearly separated",
+            "prompt": "a blue dog sitting, full body, sharp details, right side, clearly separated",
             "position": "right",
             "neg_target": "red cat, red fur",
         }
     ]
 
-    print("Generating image (Clean Background + Strict Isolation)...")
+    # ==========================================================================
+    # 执行生成
+    # ==========================================================================
+    print("🎨 Generating image (With Cross-Attn Gating & Softmax Mask)...")
     seed = 2024
 
     result = carc_pipe(
@@ -65,24 +83,31 @@ def main():
         height=1024,
         num_inference_steps=40,
 
-        cfg_pos=7.0,
-        cfg_neg=3.0,
+        # 引导系数
+        cfg_pos=7.5,
+        cfg_neg=3.0,          
 
-        mask_update_interval=6,
-        bg_update_interval=4,
+        # 掩码策略
+        mask_update_interval=5, # 开启 Probe
+        bg_update_interval=2,
 
+        # Mask Manager 参数 (传递给 pipeline)
         beta=0.6,
         safety_expand=0.05,   # 严防越界
-        gap_ratio=0.08,       # 初始留出 8% 的中缝
-        kappa=1.5,            # 强力差分
+        gap_ratio=0.08,       # 初始中缝 8%
+        bg_floor=0.05,        # 背景底权重
+        
+        # 融合系数
+        kappa=1.5,            # 强力差分融合
 
         seed=seed,
     )
 
     os.makedirs("outputs", exist_ok=True)
-    save_path = f"outputs/carc_final_clean_seed{seed}.png"
+    save_path = f"outputs/carc_final_v11_seed{seed}.png"
     save_output(result, save_path)
-    print(f"Done. Saved to: {save_path}")
+    print(f"✅ Done. Saved to: {save_path}")
+    print("Expectation: Two separate animals, correct colors, unified background.")
 
 if __name__ == "__main__":
     main()
