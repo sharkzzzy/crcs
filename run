@@ -1,3 +1,44 @@
-import os
-os.environ["http_proxy"] = "http://proxy.mornai.cn:7890"
-os.environ["https_proxy"] = "http://proxy.mornai.cn:7890"
+Traceback (most recent call last):
+  File "/home/linux/PycharmProjects/pythonProject/new project/run_carc_demo.py", line 73, in <module>
+    output = carc_pipe(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/linux/PycharmProjects/pythonProject/new project/pipeline_carc.py", line 232, in __call__
+    _unet_forward(
+  File "/home/linux/PycharmProjects/pythonProject/new project/guidance.py", line 15, in _unet_forward
+    out = unet(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_condition.py", line 1215, in forward
+    sample, res_samples = downsample_block(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 1270, in forward
+    hidden_states = attn(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/transformers/transformer_2d.py", line 427, in forward
+    hidden_states = block(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/attention.py", line 995, in forward
+    attn_output = self.attn1(
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/linux/anaconda3/envs/torch2.4_cuda11.8/lib/python3.10/site-packages/diffusers/models/attention_processor.py", line 605, in forward
+    return self.processor(
+  File "/home/linux/PycharmProjects/pythonProject/new project/attention_processor.py", line 290, in __call__
+    context, attn_probs = self._compute_attention(query, key, value, scale, attention_mask)
+  File "/home/linux/PycharmProjects/pythonProject/new project/attention_processor.py", line 171, in _compute_attention
+    attn_scores = torch.bmm(q, k.transpose(1, 2)) * scale
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1280.00 GiB. GPU 0 has a total capacity of 21.66 GiB of which 9.94 GiB is free. Including non-PyTorch memory, this process has 11.71 GiB memory in use. Of the allocated memory 10.50 GiB is allocated by PyTorch, and 1.03 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
