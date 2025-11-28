@@ -1,6 +1,6 @@
 """
 core/mask_manager.py
-FINAL V8: Erosion-based Mask Update & Lower BG Floor.
+FINAL V9: Softmax Mutual Exclusion & Erosion Update.
 """
 
 from typing import Dict, Tuple, List, Optional
@@ -56,8 +56,9 @@ class DynamicMaskManager:
         subject_names: List[str],
         init_masks_img: Optional[Dict[str, torch.Tensor]] = None,
         safety_boxes: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
-        beta: float = 0.6, # 降低动量
-        bg_floor: float = 0.05,  # 【改动】降低背景底权重到 0.05
+        beta: float = 0.6,
+        bg_floor: float = 0.05,
+        tau: float = 0.35, # Softmax temperature
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -66,6 +67,7 @@ class DynamicMaskManager:
         self.subject_names = subject_names
         self.beta = float(beta)
         self.bg_floor = float(bg_floor)
+        self.tau = float(tau)
         self.device = device or torch.device("cpu")
         self.dtype = dtype or torch.float32
 
@@ -82,11 +84,26 @@ class DynamicMaskManager:
         self._recompute_bg_and_latent()
 
     def _recompute_bg_and_latent(self):
+        """
+        【关键升级】使用温度 Softmax 实现前景互斥 (Winner-Takes-All)。
+        """
         H, W = self.image_size
-        sum_fg = torch.zeros(1, 1, H, W, device=self.device, dtype=self.dtype)
-        for name in self.subject_names:
-            sum_fg = sum_fg + self.masks_img[name]
+        
+        # 1. 堆叠并互斥化前景
+        if len(self.subject_names) > 0:
+            fg_stack = torch.stack([self.masks_img[name] for name in self.subject_names], dim=0)
+            # Softmax 强制分离
+            fg_sharp = torch.softmax(fg_stack / max(self.tau, 1e-6), dim=0)
             
+            # 回写（保持状态清晰）
+            for i, name in enumerate(self.subject_names):
+                self.masks_img[name] = fg_sharp[i]
+                
+            sum_fg = fg_sharp.sum(dim=0)
+        else:
+            sum_fg = torch.zeros(1, 1, H, W, device=self.device, dtype=self.dtype)
+            
+        # 2. 计算背景
         w_bg = (1.0 - sum_fg).clamp(0.0, 1.0) + self.bg_floor
         denom = w_bg + sum_fg + 1e-6
         
@@ -94,6 +111,7 @@ class DynamicMaskManager:
         for name in self.subject_names:
             self.masks_img[name] = self.masks_img[name] / denom
 
+        # 3. Latent Resize (显式 align_corners=False)
         H_lat, W_lat = self.latent_size
         self.masks_latent = {}
         for name in self.subject_names:
@@ -109,7 +127,7 @@ class DynamicMaskManager:
 
     def update_from_attn(self, attn_maps_img: Dict[str, torch.Tensor]):
         """
-        【改动】使用腐蚀替代膨胀，提高阈值。
+        【升级】腐蚀 + 高阈值，使掩码更紧致。
         """
         H, W = self.image_size
         for name, amap in attn_maps_img.items():
@@ -119,16 +137,14 @@ class DynamicMaskManager:
             a = amap.to(self.device, self.dtype)
             if a.max() > 1e-6: a = a / a.max()
             
-            # 提高阈值到 0.55
+            # 阈值提高到 0.55
             a_bin = (a > 0.55).to(self.dtype)
             
-            # 【改动】腐蚀：1 - dilate(1 - mask)
-            # 先反转背景，膨胀背景 = 腐蚀前景
+            # 腐蚀逻辑：1 - dilate(1 - mask)
             a_bg = 1.0 - a_bin
             a_bg_dilated = _dilate(a_bg, k=5)
             a_erode = 1.0 - a_bg_dilated
             
-            # 平滑
             a_smooth = _gaussian_blur(a_erode, ksize=15, sigma=2.5)
             
             m_new = self.beta * a_smooth + (1.0 - self.beta) * m_prev
@@ -142,25 +158,31 @@ class DynamicMaskManager:
     @staticmethod
     def init_from_positions(
         image_size: Tuple[int, int], latent_size: Tuple[int, int], subjects: List[Dict[str, str]],
-        safety_expand: float = 0.2, bg_floor: float = 0.05, gap_ratio: float = 0.05,
+        safety_expand: float = 0.05, bg_floor: float = 0.05, gap_ratio: float = 0.06,
         device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None,
     ):
         H, W = image_size
         init_masks = {}
         boxes = {}
+        
+        # 中缝逻辑
         gap_w = max(2, int(W * gap_ratio))
         center_l, center_r = W // 2 - gap_w // 2, W // 2 + gap_w // 2
         
         for subj in subjects:
             name = subj["name"]
             position = subj.get("position", "center")
+            
             m = _make_positional_mask(image_size, position, sharpness=6.0)
             if device: m = m.to(device, dtype or torch.float32)
+            
+            # 挖空中间
             if "left" in position or "right" in position:
                 m[..., :, center_l:center_r] = 0.0
             m = _gaussian_blur(m, ksize=31, sigma=6.0)
             init_masks[name] = m
             
+            # Safety Box (Tight)
             x1, y1, x2, y2 = 0, 0, W, H
             if "left" in position: x2 = int(0.5 * W)
             elif "right" in position: x1 = int(0.5 * W)
