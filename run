@@ -6,7 +6,7 @@ from pipeline_carc import CARCPipeline, save_output
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-    print(f"🚀 Loading SDXL Base in FP32 on {device}...")
+    print(f" Loading SDXL Base in FP32 on {device}...")
 
     try:
         base_pipe = StableDiffusionXLPipeline.from_pretrained(
@@ -20,7 +20,7 @@ def main():
         base_pipe.unet.to(dtype=torch.float32)
 
         # 2. 显存优化 (可选，根据显存情况)
-        print("🔧 Enabling VAE Tiling & Slicing...")
+        print(" Enabling VAE Tiling & Slicing...")
         base_pipe.enable_vae_tiling()
         base_pipe.enable_vae_slicing()
         
@@ -73,8 +73,8 @@ def main():
     # ==========================================================================
     # 执行生成
     # ==========================================================================
-    print("🎨 Generating image (With Cross-Attn Gating & Softmax Mask)...")
-    seed = 2024
+    print(" Generating image (With Cross-Attn Gating & Softmax Mask)...")
+    seed = 42
 
     result = carc_pipe(
         global_prompt=global_prompt,
