@@ -1,0 +1,880 @@
+我给你一个完整的项目核心代码，作用是以免训练的方式对图像生成调整以精准生成。目前还是解决不了问题，生成的图像不符合预期。请你仔细检查，到底是哪里有问题。或者是这个项目本身的方向就有问题，很难实现，可行性很低。
+
+"""
+core/attention_processor.py
+FINAL V10: Cross-Attention Gating (Region Control).
+"""
+
+import math
+import re
+from typing import Dict, List, Optional, Tuple, Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ... ContextBank, AlphaScheduler, LayerSelector, _infer_scale_from_layer_id 保持不变 ...
+# 请直接保留之前的定义
+class ContextBank:
+    def __init__(self):
+        self._store: Dict[str, Dict[str, torch.Tensor]] = {}
+    def clear(self):
+        self._store.clear()
+    def put(self, layer_id: str, K: torch.Tensor, V: torch.Tensor):
+        self._store[layer_id] = {"K": K.detach().to(dtype=torch.float16), "V": V.detach().to(dtype=torch.float16)}
+    def has(self, layer_id: str) -> bool:
+        return layer_id in self._store
+    def get(self, layer_id: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._store[layer_id]["K"], self._store[layer_id]["V"]
+
+class AlphaScheduler:
+    def __init__(self, construct_phase=(0.0, 0.4, 0.2), texture_phase=(0.4, 0.8, 0.8), refine_phase=(0.8, 1.0, 0.5), per_layer_scaling=None):
+        self.phases = [construct_phase, texture_phase, refine_phase]
+        self.per_layer_scaling = per_layer_scaling or {"lowres": 1.0, "midres": 0.6, "hires": 0.35}
+    def alpha(self, step_idx: int, total_steps: int, layer_id: str) -> float:
+        frac = step_idx / max(total_steps - 1, 1)
+        val = self.phases[-1][2]
+        is_refine = False
+        for start, end, a in self.phases:
+            if start <= frac <= end:
+                val = a
+                if start >= 0.8: is_refine = True
+                break
+        lid = layer_id or ""
+        if "down_blocks.2" in lid or "mid_block" in lid or "up_blocks.0" in lid:
+            scale = self.per_layer_scaling.get("midres", 0.6)
+        elif "down_blocks.0" in lid or "down_blocks.1" in lid:
+            scale = self.per_layer_scaling.get("lowres", 1.0)
+        else:
+            scale = self.per_layer_scaling.get("hires", 0.35) if is_refine else 0.0
+        return float(val * scale)
+
+class LayerSelector:
+    def __init__(self, patterns=None, probe_patterns=None):
+        self.patterns = patterns or ["down_blocks.2", "mid_block", "up_blocks.0", "up_blocks.2"]
+        self.probe_patterns = probe_patterns or ["down_blocks.2", "mid_block"]
+    def for_inject(self, layer_id: str) -> bool:
+        return layer_id and any(p in layer_id for p in self.patterns)
+    def for_probe(self, layer_id: str) -> bool:
+        return layer_id and any(p in layer_id for p in self.probe_patterns)
+
+def _infer_scale_from_layer_id(layer_id: str) -> int:
+    if not layer_id: return 1
+    if "mid_block" in layer_id: return 8
+    m = re.search(r"down_blocks.(\d+)", layer_id)
+    if m: return 2 ** int(m.group(1))
+    m2 = re.search(r"up_blocks.(\d+)", layer_id)
+    if m2: return {0: 4, 1: 2, 2: 1}.get(int(m2.group(1)), 1)
+    return 1
+
+# ==============================================================================
+# MAIN PROCESSOR (With Gating)
+# ==============================================================================
+class CARCAttentionProcessor(nn.Module):
+    def __init__(
+        self,
+        context_bank: Optional[ContextBank] = None,
+        alpha_scheduler: Optional[AlphaScheduler] = None,
+        layer_selector: Optional[LayerSelector] = None,
+    ):
+        super().__init__()
+        self.context_bank = context_bank or ContextBank()
+        self.alpha_scheduler = alpha_scheduler or AlphaScheduler()
+        self.layer_selector = layer_selector or LayerSelector()
+
+        self.mode: str = "off"
+        self.probe_enabled: bool = False
+        self.step_idx: int = 0
+        self.total_steps: int = 50
+        self.subject_id: Optional[int] = None
+        self.base_latent_hw: Optional[Tuple[int, int]] = None
+        
+        self.subject_token_ids: Dict[int, List[int]] = {}
+        self._attn_accumulator: Dict[int, torch.Tensor] = {}
+        
+        # 【新增】区域门控掩码
+        self._region_mask: Optional[torch.Tensor] = None # [1,1,H0,W0]
+
+    # --- Setters ---
+    def set_mode(self, mode: str): self.mode = mode
+    def set_probe_enabled(self, flag: bool):
+        self.probe_enabled = bool(flag)
+        if self.probe_enabled: self._attn_accumulator.clear()
+    def set_step_index(self, idx: int, total: int):
+        self.step_idx, self.total_steps = int(idx), int(total)
+    def set_subject_id(self, i: Optional[int]): self.subject_id = i
+    def set_subject_token_ids(self, mapping: Dict[int, List[int]]): self.subject_token_ids = mapping or {}
+    def set_base_latent_hw(self, h: int, w: int): self.base_latent_hw = (int(h), int(w))
+    
+    # 【新增】设置区域掩码
+    def set_region_mask(self, mask: Optional[torch.Tensor]):
+        self._region_mask = mask
+
+    @torch.no_grad()
+    def pop_attn_maps(self) -> Dict[int, torch.Tensor]:
+        out = {}
+        for sid, amap in self._attn_accumulator.items():
+            mi, ma = amap.min(), amap.max()
+            out[sid] = (amap - mi) / (ma - mi + 1e-8)
+        self._attn_accumulator.clear()
+        return out
+
+    # --- Helpers ---
+    def _align_bg_batch(self, key, K_bg, V_bg):
+        if K_bg.shape[0] != key.shape[0]:
+            r = key.shape[0] // K_bg.shape[0]
+            K_bg, V_bg = K_bg.repeat(r, 1, 1), V_bg.repeat(r, 1, 1)
+        return K_bg, V_bg
+
+    def _subsample_kv(self, layer_id, K, V): return K, V
+
+    def _sdpa(self, q, k, v, scale=None):
+        if scale: q = q * scale * math.sqrt(q.shape[-1])
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+
+    def _manual_attn(self, q, k, v, scale):
+        attn_scores = torch.bmm(q, k.transpose(1, 2)) * scale
+        attn_probs = attn_scores.softmax(dim=-1)
+        context = torch.bmm(attn_probs, v)
+        return context, attn_probs
+
+    # 【新增】生成当前层的查询掩码
+    def _make_query_mask(self, layer_id: str, q: torch.Tensor) -> Optional[torch.Tensor]:
+        if self._region_mask is None or self.base_latent_hw is None: return None
+        H0, W0 = self.base_latent_hw
+        s = _infer_scale_from_layer_id(layer_id)
+        h, w = max(1, H0 // s), max(1, W0 // s)
+        Lq = q.shape[1]
+        
+        # 仅当序列长度匹配时生效 (Cross-Attn Q is spatial)
+        if Lq != h * w: return None
+        
+        # 下采样 mask
+        m = F.interpolate(self._region_mask, size=(h, w), mode="bilinear", align_corners=False)
+        m1d = m.reshape(1, 1, -1) # [1,1,Lq]
+        
+        # 扩展到 Batch*Heads
+        BxH = q.shape[0]
+        m1d = m1d.expand(BxH, -1, -1).squeeze(1) # [BxH, Lq]
+        return m1d.clamp(0.0, 1.0)
+
+    def _probe_cross_attn(self, attn_probs, layer_id, batch_size):
+        if not (self.probe_enabled and self.layer_selector.for_probe(layer_id) and self.subject_id is not None): return
+        token_ids = self.subject_token_ids.get(self.subject_id, [])
+        if not token_ids: return
+        idx = torch.tensor(token_ids, dtype=torch.long, device=attn_probs.device)
+        sel = attn_probs.index_select(dim=-1, index=idx).mean(dim=-1)
+        bxh, Lq = sel.shape
+        heads = bxh // max(1, batch_size)
+        sel = sel.reshape(batch_size, heads, Lq).mean(dim=1)
+        amap_1d = sel[0:1] 
+        if self.base_latent_hw is None: return
+        h0, w0 = self.base_latent_hw
+        s = _infer_scale_from_layer_id(layer_id)
+        h, w = max(1, h0 // s), max(1, w0 // s)
+        if amap_1d.shape[-1] != h * w:
+            sq = int(math.sqrt(amap_1d.shape[-1]))
+            if sq*sq == amap_1d.shape[-1]: h, w = sq, sq
+            else: return
+        amap_2d = amap_1d.reshape(1, 1, h, w)
+        amap_up = F.interpolate(amap_2d, size=(h0, w0), mode="bilinear", align_corners=False)
+        prev = self._attn_accumulator.get(self.subject_id, None)
+        self._attn_accumulator[self.subject_id] = amap_up if prev is None else (prev + amap_up)
+
+    # --- Forward ---
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs):
+        layer_id = getattr(attn, "layer_id", None)
+        is_self_attn = encoder_hidden_states is None
+        
+        q = attn.to_q(hidden_states)
+        if is_self_attn:
+            k, v = attn.to_k(hidden_states), attn.to_v(hidden_states)
+        else:
+            k, v = attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states)
+
+        q, k, v = attn.head_to_batch_dim(q), attn.head_to_batch_dim(k), attn.head_to_batch_dim(v)
+
+        # Self-Attn Injection
+        if is_self_attn and self.layer_selector.for_inject(layer_id):
+            if self.mode == "record_bg":
+                self.context_bank.put(layer_id, k, v)
+            elif self.mode == "inject_subject" and self.context_bank.has(layer_id):
+                K_bg, V_bg = self.context_bank.get(layer_id)
+                K_bg, V_bg = self._align_bg_batch(k, K_bg.to(k), V_bg.to(v))
+                alpha = self.alpha_scheduler.alpha(self.step_idx, self.total_steps, layer_id)
+                if alpha > 0:
+                    k, v = torch.cat([k, alpha*K_bg], 1), torch.cat([v, alpha*V_bg], 1)
+                attention_mask = None
+
+        scale = getattr(attn, "scale", 1.0 / math.sqrt(q.shape[-1]))
+
+        if is_self_attn:
+            context = self._sdpa(q, k, v, scale)
+        else:
+            # Cross-Attn Logic
+            # 【关键修改】如果是在做 Subject Injection 并且层允许，就启用门控
+            # 注意：LayerSelector 这里既控制 Self-Attn 注入，也控制 Cross-Attn 门控，这是合理的
+            if self.mode == "inject_subject" and self.layer_selector.for_inject(layer_id):
+                # 必须用 Manual Attn 才能修改 probs
+                context, attn_probs = self._manual_attn(q, k, v, scale)
+                
+                # 1. 探针 (如果启用)
+                self._probe_cross_attn(attn_probs.detach(), layer_id, hidden_states.shape[0])
+                
+                # 2. 空间门控 (Spatial Gating)
+                qm = self._make_query_mask(layer_id, q)
+                if qm is not None:
+                    # qm: [B*H, Lq] -> unsqueeze -> [B*H, Lq, 1] (广播到 Key 维)
+                    attn_probs = attn_probs * qm.unsqueeze(-1)
+                    # 重新归一化
+                    denom = attn_probs.sum(dim=-1, keepdim=True) + 1e-6
+                    attn_probs = attn_probs / denom
+                    context = torch.bmm(attn_probs, v)
+            else:
+                # 默认走 SDPA
+                context = self._sdpa(q, k, v, scale)
+
+        return attn.to_out[0](attn.batch_to_head_dim(context))
+
+def create_carc_attention_processor(context_bank=None, alpha_scheduler=None, layer_selector=None):
+    return CARCAttentionProcessor(context_bank, alpha_scheduler, layer_selector)
+
+"""
+core/guidance.py
+FINAL V2: Sequential Forward for Peak Memory Reduction.
+"""
+
+from typing import Optional, Dict, Any, Tuple
+import torch
+
+def _unet_forward(
+    unet, 
+    latents: torch.Tensor, 
+    t: torch.Tensor, 
+    encoder_hidden_states: torch.Tensor,
+    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None
+) -> torch.Tensor:
+    """Helper for single forward pass."""
+    out = unet(
+        latents, 
+        t, 
+        encoder_hidden_states=encoder_hidden_states,
+        added_cond_kwargs=added_cond_kwargs
+    )
+    if isinstance(out, dict):
+        return out.get("sample", out.get("out"))
+    return getattr(out, "sample", out)
+
+@torch.no_grad()
+def compute_cfg(
+    unet,
+    latents: torch.Tensor,
+    t: torch.Tensor,
+    emb_pos: torch.Tensor,
+    emb_uncond: torch.Tensor,
+    added_cond_kwargs_pos: Dict[str, torch.Tensor],
+    added_cond_kwargs_uncond: Dict[str, torch.Tensor],
+    cfg_pos: float,
+) -> torch.Tensor:
+    """
+    Standard CFG: Sequential Execution to save VRAM.
+    """
+    # 1. Uncond Pass
+    eps_uncond = _unet_forward(unet, latents, t, emb_uncond, added_cond_kwargs_uncond)
+    
+    # 2. Pos Pass
+    eps_pos = _unet_forward(unet, latents, t, emb_pos, added_cond_kwargs_pos)
+    
+    # Combine
+    return eps_uncond + cfg_pos * (eps_pos - eps_uncond)
+
+@torch.no_grad()
+def compute_contrastive_cfg(
+    unet,
+    latents: torch.Tensor,
+    t: torch.Tensor,
+    emb_pos: torch.Tensor,
+    emb_uncond: torch.Tensor,
+    emb_neg_target: torch.Tensor,
+    added_cond_kwargs_pos: Dict[str, torch.Tensor],
+    added_cond_kwargs_uncond: Dict[str, torch.Tensor],
+    cfg_pos: float,
+    cfg_neg: float,
+) -> torch.Tensor:
+    """
+    Contrastive Guidance: Sequential Execution.
+    eps = uncond + s1*(pos-uncond) - s2*(neg-uncond)
+    """
+    # 1. Uncond Pass
+    eps_uncond = _unet_forward(unet, latents, t, emb_uncond, added_cond_kwargs_uncond)
+    
+    # 2. Pos Pass
+    eps_pos = _unet_forward(unet, latents, t, emb_pos, added_cond_kwargs_pos)
+    
+    # 3. Neg Target Pass (Neg Target usually reuses uncond structure info)
+    eps_neg = _unet_forward(unet, latents, t, emb_neg_target, added_cond_kwargs_uncond)
+    
+    # Combine
+    return eps_uncond + cfg_pos * (eps_pos - eps_uncond) - cfg_neg * (eps_neg - eps_uncond)
+
+def prepare_timesteps(scheduler, num_inference_steps: int, device: torch.device):
+    scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps = scheduler.timesteps
+    if not isinstance(timesteps, torch.Tensor):
+        timesteps = torch.tensor(timesteps, device=device, dtype=torch.long)
+    return timesteps
+
+"""
+core/mask_manager.py
+FINAL V9: Softmax Mutual Exclusion & Erosion Update.
+"""
+
+from typing import Dict, Tuple, List, Optional
+import torch
+import torch.nn.functional as F
+
+def _gaussian_kernel(ksize: int, sigma: float, device, dtype):
+    if ksize % 2 == 0: ksize += 1
+    ax = torch.arange(ksize, device=device, dtype=dtype) - (ksize - 1) / 2.0
+    xx = ax[None, :]
+    yy = ax[:, None]
+    kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma * sigma))
+    kernel = kernel / kernel.sum()
+    return kernel[None, None, :, :]
+
+def _dilate(m: torch.Tensor, k: int = 3) -> torch.Tensor:
+    pad = k // 2
+    return F.max_pool2d(m, kernel_size=k, stride=1, padding=pad)
+
+def _gaussian_blur(m: torch.Tensor, ksize: int = 7, sigma: float = 1.5) -> torch.Tensor:
+    kernel = _gaussian_kernel(ksize, sigma, m.device, m.dtype)
+    pad = ksize // 2
+    m_padded = F.pad(m, (pad, pad, pad, pad), mode="reflect")
+    return F.conv2d(m_padded, kernel)
+
+def _clip_to_box(mask: torch.Tensor, box_xyxy: Tuple[int, int, int, int]) -> torch.Tensor:
+    H, W = mask.shape[-2], mask.shape[-1]
+    x1, y1, x2, y2 = box_xyxy
+    clipped = torch.zeros_like(mask)
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(W, int(x2)), min(H, int(y2))
+    if x2 > x1 and y2 > y1:
+        clipped[..., y1:y2, x1:x2] = mask[..., y1:y2, x1:x2]
+    return clipped
+
+def _make_positional_mask(image_size: Tuple[int, int], position: str, sharpness: float = 6.0) -> torch.Tensor:
+    H, W = image_size
+    yy = torch.linspace(0, 1, steps=H).unsqueeze(1).repeat(1, W)
+    xx = torch.linspace(0, 1, steps=W).unsqueeze(0).repeat(H, 1)
+    pos = position.lower()
+    if "left" in pos: mask = torch.sigmoid((0.5 - xx) * sharpness)
+    elif "right" in pos: mask = torch.sigmoid((xx - 0.5) * sharpness)
+    elif "top" in pos: mask = torch.sigmoid((0.5 - yy) * sharpness)
+    elif "bottom" in pos: mask = torch.sigmoid((yy - 0.5) * sharpness)
+    else: mask = torch.ones(H, W)
+    return mask[None, None]
+
+class DynamicMaskManager:
+    def __init__(
+        self,
+        image_size: Tuple[int, int],
+        latent_size: Tuple[int, int],
+        subject_names: List[str],
+        init_masks_img: Optional[Dict[str, torch.Tensor]] = None,
+        safety_boxes: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
+        beta: float = 0.6,
+        bg_floor: float = 0.05,
+        tau: float = 0.35, # Softmax temperature
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        self.image_size = image_size
+        self.latent_size = latent_size
+        self.subject_names = subject_names
+        self.beta = float(beta)
+        self.bg_floor = float(bg_floor)
+        self.tau = float(tau)
+        self.device = device or torch.device("cpu")
+        self.dtype = dtype or torch.float32
+
+        H, W = image_size
+        self.masks_img: Dict[str, torch.Tensor] = {}
+        for name in subject_names:
+            if init_masks_img and name in init_masks_img:
+                m = init_masks_img[name].to(self.device, self.dtype)
+            else:
+                m = torch.zeros(1, 1, H, W, device=self.device, dtype=self.dtype)
+            self.masks_img[name] = m
+
+        self.safety_boxes = safety_boxes or {name: (0, 0, W, H) for name in subject_names}
+        self._recompute_bg_and_latent()
+
+    def _recompute_bg_and_latent(self):
+        """
+        【关键升级】使用温度 Softmax 实现前景互斥 (Winner-Takes-All)。
+        """
+        H, W = self.image_size
+        
+        # 1. 堆叠并互斥化前景
+        if len(self.subject_names) > 0:
+            fg_stack = torch.stack([self.masks_img[name] for name in self.subject_names], dim=0)
+            # Softmax 强制分离
+            fg_sharp = torch.softmax(fg_stack / max(self.tau, 1e-6), dim=0)
+            
+            # 回写（保持状态清晰）
+            for i, name in enumerate(self.subject_names):
+                self.masks_img[name] = fg_sharp[i]
+                
+            sum_fg = fg_sharp.sum(dim=0)
+        else:
+            sum_fg = torch.zeros(1, 1, H, W, device=self.device, dtype=self.dtype)
+            
+        # 2. 计算背景
+        w_bg = (1.0 - sum_fg).clamp(0.0, 1.0) + self.bg_floor
+        denom = w_bg + sum_fg + 1e-6
+        
+        self.bg_mask_img = w_bg / denom
+        for name in self.subject_names:
+            self.masks_img[name] = self.masks_img[name] / denom
+
+        # 3. Latent Resize (显式 align_corners=False)
+        H_lat, W_lat = self.latent_size
+        self.masks_latent = {}
+        for name in self.subject_names:
+            self.masks_latent[name] = F.interpolate(
+                self.masks_img[name], size=(H_lat, W_lat), mode="bilinear", align_corners=False
+            )
+        self.bg_mask_latent = F.interpolate(
+            self.bg_mask_img, size=(H_lat, W_lat), mode="bilinear", align_corners=False
+        )
+
+    def get_masks_latent(self) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        return self.masks_latent, self.bg_mask_latent
+
+    def update_from_attn(self, attn_maps_img: Dict[str, torch.Tensor]):
+        """
+        【升级】腐蚀 + 高阈值，使掩码更紧致。
+        """
+        H, W = self.image_size
+        for name, amap in attn_maps_img.items():
+            if name not in self.masks_img: continue
+            
+            m_prev = self.masks_img[name]
+            a = amap.to(self.device, self.dtype)
+            if a.max() > 1e-6: a = a / a.max()
+            
+            # 阈值提高到 0.55
+            a_bin = (a > 0.55).to(self.dtype)
+            
+            # 腐蚀逻辑：1 - dilate(1 - mask)
+            a_bg = 1.0 - a_bin
+            a_bg_dilated = _dilate(a_bg, k=5)
+            a_erode = 1.0 - a_bg_dilated
+            
+            a_smooth = _gaussian_blur(a_erode, ksize=15, sigma=2.5)
+            
+            m_new = self.beta * a_smooth + (1.0 - self.beta) * m_prev
+            box = self.safety_boxes.get(name, (0, 0, W, H))
+            m_boxed = _clip_to_box(m_new, box)
+            
+            self.masks_img[name] = m_boxed.clamp(0.0, 1.0)
+
+        self._recompute_bg_and_latent()
+
+    @staticmethod
+    def init_from_positions(
+        image_size: Tuple[int, int], latent_size: Tuple[int, int], subjects: List[Dict[str, str]],
+        safety_expand: float = 0.05, bg_floor: float = 0.05, gap_ratio: float = 0.06,
+        device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None,
+    ):
+        H, W = image_size
+        init_masks = {}
+        boxes = {}
+        
+        # 中缝逻辑
+        gap_w = max(2, int(W * gap_ratio))
+        center_l, center_r = W // 2 - gap_w // 2, W // 2 + gap_w // 2
+        
+        for subj in subjects:
+            name = subj["name"]
+            position = subj.get("position", "center")
+            
+            m = _make_positional_mask(image_size, position, sharpness=6.0)
+            if device: m = m.to(device, dtype or torch.float32)
+            
+            # 挖空中间
+            if "left" in position or "right" in position:
+                m[..., :, center_l:center_r] = 0.0
+            m = _gaussian_blur(m, ksize=31, sigma=6.0)
+            init_masks[name] = m
+            
+            # Safety Box (Tight)
+            x1, y1, x2, y2 = 0, 0, W, H
+            if "left" in position: x2 = int(0.5 * W)
+            elif "right" in position: x1 = int(0.5 * W)
+            
+            w_box, h_box = x2 - x1, y2 - y1
+            ex, ey = int(w_box * safety_expand), int(h_box * safety_expand)
+            boxes[name] = (max(0, x1 - ex), max(0, y1 - ey), min(W, x2 + ex), min(H, y2 + ey))
+
+        return DynamicMaskManager(image_size, latent_size, [s["name"] for s in subjects], init_masks, boxes, beta=0.6, bg_floor=bg_floor, device=device, dtype=dtype)
+"""
+pipeline_carc.py
+FINAL V10: Fixes Parameter Passing to MaskManager.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+import torch
+from torchvision.utils import save_image
+import torch.nn.functional as F
+
+from attention_processor import (
+    CARCAttentionProcessor, ContextBank, AlphaScheduler, LayerSelector,
+)
+from guidance import (
+    compute_contrastive_cfg, compute_cfg, prepare_timesteps, _unet_forward
+)
+from mask_manager import DynamicMaskManager
+
+def _seed_everything(seed: int):
+    import random, numpy as np
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+def _prepare_latents(batch_size, channels, height, width, dtype, device, scheduler, generator=None):
+    shape = (batch_size, channels, height, width)
+    latents = torch.randn(shape, device=device, dtype=dtype, generator=generator)
+    latents = latents * scheduler.init_noise_sigma
+    return latents
+
+def _decode_vae(vae, latents: torch.Tensor) -> torch.Tensor:
+    latents = latents / vae.config.scaling_factor
+    latents = latents.to(dtype=vae.dtype)
+    with torch.no_grad():
+        image = vae.decode(latents).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    return image
+
+def _attach_processors_to_unet(unet, processor: CARCAttentionProcessor):
+    for n, m in unet.named_modules():
+        if hasattr(m, "to_q") and hasattr(m, "to_k"):
+            setattr(m, "layer_id", n)
+    unet.set_attn_processor(processor)
+
+def _token_indices_for_keywords(tokenizer, prompt: str, keywords: List[str]) -> List[int]:
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    decoded = [tokenizer.decode([i]).strip().lower() for i in input_ids]
+    indices = []
+    kw_lower = [k.lower() for k in keywords]
+    for i, token_str in enumerate(decoded):
+        if any(k in token_str for k in kw_lower):
+            indices.append(i) 
+    return [i + 1 for i in indices] 
+
+class CARCPipeline:
+    def __init__(
+        self,
+        base_pipe,
+        alpha_cfg: Optional[Dict[str, Any]] = None,
+        inject_layer_patterns: Optional[List[str]] = None,
+    ):
+        self.pipe = base_pipe
+        self.unet = base_pipe.unet
+        self.vae = base_pipe.vae
+        self.scheduler = base_pipe.scheduler
+        self.device = base_pipe.device
+        self.dtype = self.unet.dtype
+
+        self.context_bank = ContextBank()
+        alpha_scheduler = AlphaScheduler(**(alpha_cfg or {}))
+        layer_selector = LayerSelector(inject_layer_patterns)
+        
+        self.attn_proc = CARCAttentionProcessor(self.context_bank, alpha_scheduler, layer_selector)
+        _attach_processors_to_unet(self.unet, self.attn_proc)
+
+    def _encode_prompt(self, prompt: str, negative_prompt: str = ""):
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = self.pipe.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            device=self.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=negative_prompt,
+        )
+        return (
+            prompt_embeds, negative_prompt_embeds, 
+            pooled_prompt_embeds, negative_pooled_prompt_embeds
+        )
+
+    def _prepare_embeddings(self, global_prompt, subjects, width, height):
+        embs = {}
+        original_size = (height, width)
+        target_size = (height, width)
+        crops_coords_top_left = (0, 0)
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor([add_time_ids], dtype=torch.float32, device=self.device)
+        
+        def pack_cond(pos_emb, neg_emb, pos_pool, neg_pool):
+            return {
+                "pos": pos_emb,
+                "uncond": neg_emb,
+                "added_pos": {"text_embeds": pos_pool, "time_ids": add_time_ids},
+                "added_uncond": {"text_embeds": neg_pool, "time_ids": add_time_ids},
+            }
+
+        pe, ne, pp, np = self._encode_prompt(global_prompt, "")
+        embs["global"] = pack_cond(pe, ne, pp, np)
+        
+        for subj in subjects:
+            name = subj["name"]
+            spe, sne, spp, snp = self._encode_prompt(subj["prompt"], "")
+            neg_target_text = subj.get("neg_target", "")
+            if neg_target_text:
+                nt_pe, _, nt_pp, _ = self._encode_prompt(neg_target_text, "")
+                embs[name] = pack_cond(spe, sne, spp, snp)
+                embs[name]["neg_target"] = nt_pe
+                embs[name]["added_neg_target"] = {"text_embeds": nt_pp, "time_ids": add_time_ids}
+            else:
+                embs[name] = pack_cond(spe, sne, spp, snp)
+                embs[name]["neg_target"] = None
+        return embs
+
+    def _get_subject_token_ids(self, subjects):
+        mapping = {}
+        for i, subj in enumerate(subjects):
+            mapping[i] = _token_indices_for_keywords(
+                self.pipe.tokenizer, subj["prompt"], [subj["name"]]
+            )
+        return mapping
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        global_prompt: str,
+        subjects: List[Dict[str, str]],
+        width: int = 1024,
+        height: int = 1024,
+        num_inference_steps: int = 50,
+        cfg_pos: float = 7.5,
+        cfg_neg: float = 3.0,
+        mask_update_interval: int = 5,
+        bg_update_interval: int = 2,
+        beta: float = 0.6,
+        safety_expand: float = 0.05,
+        bg_floor: float = 0.05,
+        gap_ratio: float = 0.06,
+        kappa: float = 1.5,
+        seed: int = 42,
+    ):
+        _seed_everything(seed)
+        
+        # ... (Setup 和 Phase A/B 不变) ...
+        # 这里简写，请确保你保留了之前的 Setup 代码
+        embs = self._prepare_embeddings(global_prompt, subjects, width, height)
+        self.attn_proc.set_subject_token_ids(self._get_subject_token_ids(subjects))
+        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+        latent_h, latent_w = height // 8, width // 8
+        latents = _prepare_latents(1, 4, latent_h, latent_w, self.dtype, self.device, self.scheduler, generator=torch.Generator(device=self.device).manual_seed(seed))
+        mask_mgr = DynamicMaskManager.init_from_positions((height, width), (latent_h, latent_w), subjects, safety_expand=safety_expand, bg_floor=bg_floor, gap_ratio=gap_ratio, device=self.device, dtype=self.dtype)
+        mask_mgr.beta = beta
+        self.attn_proc.set_base_latent_hw(latent_h, latent_w)
+        
+        for i, t in enumerate(timesteps):
+            self.attn_proc.set_step_index(i, num_inference_steps)
+            latent_model_input = self.scheduler.scale_model_input(latents, t)
+            
+            # Phase A: Background
+            if i % bg_update_interval == 0:
+                self.context_bank.clear()
+                self.attn_proc.set_mode("record_bg")
+                self.attn_proc.set_probe_enabled(False)
+                # 清除区域掩码，背景不需要门控
+                self.attn_proc.set_region_mask(None) 
+                _unet_forward(self.unet, latent_model_input, t, embs["global"]["pos"], embs["global"]["added_pos"])
+            
+            # Phase B
+            self.attn_proc.set_mode("off")
+            self.attn_proc.set_region_mask(None)
+            eps_bg = compute_cfg(self.unet, latent_model_input, t, embs["global"]["pos"], embs["global"]["uncond"], embs["global"]["added_pos"], embs["global"]["added_uncond"], cfg_pos)
+            
+            # Phase C: Subjects
+            do_probe = (i % mask_update_interval == 0)
+            eps_subjects = {}
+            
+            # 获取当前掩码用于门控
+            masks_latent_gate, _ = mask_mgr.get_masks_latent()
+            
+            for sid, subj in enumerate(subjects):
+                name = subj["name"]
+                self.attn_proc.set_subject_id(sid)
+                s_emb = embs[name]
+                
+                # 【新增】设置区域门控掩码！
+                # 这会传给 Attention Processor，在 Cross-Attn 时把 mask 外的权重置零
+                self.attn_proc.set_region_mask(masks_latent_gate[name])
+                
+                # C.1 Probe
+                if do_probe:
+                    self.attn_proc.set_mode("inject_subject")
+                    self.attn_proc.set_probe_enabled(True)
+                    _unet_forward(self.unet, latent_model_input, t, s_emb["pos"], s_emb["added_pos"])
+                
+                # C.2 Noise
+                self.attn_proc.set_mode("inject_subject")
+                self.attn_proc.set_probe_enabled(False)
+                
+                if s_emb["neg_target"] is not None:
+                    eps_sub = compute_contrastive_cfg(self.unet, latent_model_input, t, s_emb["pos"], s_emb["uncond"], s_emb["neg_target"], s_emb["added_pos"], s_emb["added_uncond"], cfg_pos, cfg_neg)
+                else:
+                    eps_sub = compute_cfg(self.unet, latent_model_input, t, s_emb["pos"], s_emb["uncond"], s_emb["added_pos"], s_emb["added_uncond"], cfg_pos)
+                eps_subjects[name] = eps_sub
+                
+            # 【重要】跑完主体后清除掩码，以免影响后续步骤（虽然下一轮循环开始会重置，但清空是好习惯）
+            self.attn_proc.set_region_mask(None)
+
+            # Phase D
+            masks_latent, bg_mask_latent = mask_mgr.get_masks_latent()
+            def expand(m): return m.expand(latents.shape[0], 4, -1, -1)
+            eps_final = eps_bg 
+            for name, eps_s in eps_subjects.items():
+                w = expand(masks_latent[name])
+                eps_final = eps_final + kappa * w * (eps_s - eps_bg)
+            latents = self.scheduler.step(eps_final, t, latents).prev_sample
+            
+            # Phase E
+            if do_probe:
+                attn_maps = self.attn_proc.pop_attn_maps()
+                maps_img = {}
+                for sid, amap in attn_maps.items():
+                    name = subjects[sid]["name"]
+                    maps_img[name] = F.interpolate(amap, size=(height, width), mode="bilinear", align_corners=False)
+                if maps_img: mask_mgr.update_from_attn(maps_img)
+
+        image = _decode_vae(self.vae, latents)
+        return {"image": image}
+
+def save_output(out, path):
+    save_image(out["image"], path)
+以下是测试代码：import os
+import torch
+from diffusers import StableDiffusionXLPipeline
+from pipeline_carc import CARCPipeline, save_output
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+    print(f" Loading SDXL Base in FP32 on {device}...")
+
+    try:
+        base_pipe = StableDiffusionXLPipeline.from_pretrained(
+            model_id,
+            use_safetensors=True,
+        ).to(device)
+
+        # 1. 强制全 FP32 (最稳)
+        base_pipe.vae.to(dtype=torch.float32)
+        base_pipe.text_encoder_2.to(dtype=torch.float32)
+        base_pipe.unet.to(dtype=torch.float32)
+
+        # 2. 显存优化 (可选，根据显存情况)
+        print(" Enabling VAE Tiling & Slicing...")
+        base_pipe.enable_vae_tiling()
+        base_pipe.enable_vae_slicing()
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        exit(1)
+
+    # ==========================================================================
+    # CARC 初始化
+    # ==========================================================================
+    # 注入层：包含低/中层，避开极高分层 (up.1/up.2) 防止语义错乱
+    # up_blocks.0 是 32x32，是核心层，必须保留
+    inject_patterns = ["down_blocks.2", "mid_block", "up_blocks.0"]
+    
+    alpha_config = {
+        "construct_phase": (0.0, 0.35, 0.15),
+        "texture_phase":   (0.35, 0.75, 0.6), # 中段强度适中
+        "refine_phase":    (0.75, 1.0, 0.45),
+    }
+
+    carc_pipe = CARCPipeline(
+        base_pipe=base_pipe,
+        alpha_cfg=alpha_config,
+        inject_layer_patterns=inject_patterns
+    )
+
+    # ==========================================================================
+    # 提示词策略 (Clean Global + Strong Local)
+    # ==========================================================================
+    # 全局：纯背景，绝对不提猫狗，防止生成底图怪物
+    global_bg = "in a sunny park with green grass and trees, blurred background, cinematic lighting, 8k, photorealistic"
+    global_prompt = f"A wide photo of a park scene, {global_bg}"
+
+    subjects = [
+        {
+            "name": "cat",
+            # 强调独立性
+            "prompt": "a red cat sitting, full body, fluffy, sharp details, left side, clearly separated",
+            "position": "left",
+            "neg_target": "blue dog, blue fur",
+        },
+        {
+            "name": "dog",
+            "prompt": "a blue dog sitting, full body, sharp details, right side, clearly separated",
+            "position": "right",
+            "neg_target": "red cat, red fur",
+        }
+    ]
+
+    # ==========================================================================
+    # 执行生成
+    # ==========================================================================
+    print(" Generating image (With Cross-Attn Gating & Softmax Mask)...")
+    seed = 42
+
+    result = carc_pipe(
+        global_prompt=global_prompt,
+        subjects=subjects,
+        width=1024,
+        height=1024,
+        num_inference_steps=40,
+
+        # 引导系数
+        cfg_pos=7.5,
+        cfg_neg=3.0,          
+
+        # 掩码策略
+        mask_update_interval=5, # 开启 Probe
+        bg_update_interval=2,
+
+        # Mask Manager 参数 (传递给 pipeline)
+        beta=0.6,
+        safety_expand=0.05,   # 严防越界
+        gap_ratio=0.08,       # 初始中缝 8%
+        bg_floor=0.05,        # 背景底权重
+        
+        # 融合系数
+        kappa=1.5,            # 强力差分融合
+
+        seed=seed,
+    )
+
+    os.makedirs("outputs", exist_ok=True)
+    save_path = f"outputs/carc_final_v11_seed{seed}.png"
+    save_output(result, save_path)
+    print(f"✅ Done. Saved to: {save_path}")
+    print("Expectation: Two separate animals, correct colors, unified background.")
+
+if __name__ == "__main__":
+    main()
+
